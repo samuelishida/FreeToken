@@ -998,7 +998,24 @@ class Engine:
         set_global_ctx(self.ctx)
         self.tp_cpu_group = None
         self._baseline_free = 1 << 40
-        self.max_seq_len = config.max_seq_len
+        from freetoken.engine.sample import Sampler
+
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        from freetoken.engine.tinygrad_runner import TinygradModelRunner
+
+        # The runner's KV/state are sized to max_len: use the KV capacity
+        # (--num-tokens) when it is smaller than the model's max position, so a
+        # small KV config actually shrinks the VRAM footprint.
+        kv_cap = getattr(config, "num_token_override", None) or config.max_seq_len
+        self.tinygrad_runner = TinygradModelRunner(
+            config.model_path, config.model_config,
+            max_batch=256, max_len=min(config.max_seq_len, kv_cap),
+            max_slots=max(1, config.max_running_req),
+        )
+        # The runner's max_context (rounded up to a multiple of 128) is the real
+        # sequence ceiling: the scheduler's max_seq_len checks and the /v1/models
+        # context report must use it, not the model's native max position.
+        self.max_seq_len = self.tinygrad_runner.max_len
         self.num_pages = self.max_seq_len // max(1, config.page_size)
         self.page_table = torch.zeros(
             (config.max_running_req + 1, self.max_seq_len), dtype=torch.int32
@@ -1009,20 +1026,6 @@ class Engine:
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
         self.graph_runner = _NullGraphRunner()
-        from freetoken.engine.sample import Sampler
-
-        self.sampler = Sampler(self.device, config.model_config.vocab_size)
-        from freetoken.engine.tinygrad_runner import TinygradModelRunner
-
-        # The runner's KV/state are sized to max_len: use the KV capacity
-        # (--num-tokens) when it is smaller than the model's max position, so a
-        # small KV config actually shrinks the VRAM footprint.
-        kv_cap = getattr(config, "num_token_override", None) or self.max_seq_len
-        self.tinygrad_runner = TinygradModelRunner(
-            config.model_path, config.model_config,
-            max_batch=256, max_len=min(self.max_seq_len, kv_cap),
-            max_slots=max(1, config.max_running_req),
-        )
         self.ctx.tinygrad_runner = self.tinygrad_runner
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:

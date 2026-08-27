@@ -78,15 +78,17 @@ def test_e2e_tinygrad():
     )
     engine = Engine(config)
 
-    def forward(ids, cached_len, phase):
+    def forward(full_ids, extend, cached_len, phase):
         req = Req(
-            input_ids=ids, table_idx=0, cached_len=cached_len,
-            output_len=max(1, len(ids) - cached_len), uid=0,
+            input_ids=full_ids, table_idx=0, cached_len=cached_len,
+            output_len=max(1, len(extend)), uid=0,
             sampling_params=SamplingParams(), cache_handle=None,
         )
         batch = Batch(reqs=[req], phase=phase)
-        batch.input_ids = ids
-        batch.positions = torch.arange(len(ids), dtype=torch.int32)
+        batch.input_ids = extend
+        batch.positions = torch.arange(
+            cached_len, cached_len + len(extend), dtype=torch.int32
+        )
         batch.padded_reqs = batch.reqs
         out = engine.forward_batch(batch, engine.sampler.prepare(batch))
         return int(out.next_tokens_cpu[0].item())
@@ -96,12 +98,13 @@ def test_e2e_tinygrad():
         cached = 0
         while cached < len(ids):
             chunk_end = min(cached + 256, len(ids))
-            tok = forward(ids[:chunk_end], cached, "prefill")
+            tok = forward(ids[:chunk_end], ids[cached:chunk_end], cached, "prefill")
             cached = chunk_end
         gen.append(tok)  # only the last chunk's logits are sampled
         for _ in range(n - 1):
+            nxt = torch.tensor([gen[-1]], dtype=torch.int32)
             full = torch.cat([ids, torch.tensor(gen, dtype=torch.int32)])
-            gen.append(forward(full, len(full) - 1, "decode"))
+            gen.append(forward(full, nxt, len(full) - 1, "decode"))
         return gen
 
     try:

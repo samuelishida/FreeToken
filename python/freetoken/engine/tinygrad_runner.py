@@ -62,6 +62,10 @@ class TinygradModelRunner:
         self._v_sp = UOp.variable("start_pos", 0, max_context - 1)
         self._v_nt = UOp.variable("n_toks", 1, max_batch)
         self._buf = Tensor.zeros(1, max_context, dtype="int32")
+        # Host mirror of the prompt buffer: the scheduler sends each prefill
+        # chunk as batch.input_ids (the extend only), so the runner accumulates
+        # the full prompt here and copies the chunk at its global position.
+        self._buf_np = np.zeros((1, max_context), dtype=np.int32)
 
         def _prefill(tokens_buf, sp, nt):
             return self.model.logits(tokens_buf[:, sp : sp + nt], sp)
@@ -95,20 +99,22 @@ class TinygradModelRunner:
         assert len(batch.reqs) == 1, "tinygrad runner: max_running_req=1 only"
         req = batch.reqs[0]
         cached_len = req.cached_len
-        device_len = req.device_len
-        if device_len <= cached_len:
+        # The scheduler's batch.input_ids is the EXTEND (the prefill chunk or the
+        # single decode token), not the full sequence.
+        ids = batch.input_ids.cpu().numpy().astype(np.int32)
+        n_toks = len(ids)
+        if n_toks == 0:
             # Empty extend: the scheduler never sends it; return zeros defensively.
             return torch.zeros((1, self.vocab_size), dtype=torch.float32)
 
-        ids = batch.input_ids[cached_len:device_len].cpu().numpy().astype(np.int32)
-        n_toks = device_len - cached_len
         sp = self._v_sp.bind(cached_len)
         if n_toks == 1:
             lg = self._decode_jit(self._Tensor(ids.reshape(1, 1)), sp)
         else:
-            self._buf.assign(
-                self._Tensor(ids.reshape(1, -1)).pad_to((1, self.max_len))
-            )
+            # Accumulate the chunk at its global position and run the symbolic
+            # prefill (the AMD flash kernel pads the query tile internally).
+            self._buf_np[0, cached_len : cached_len + n_toks] = ids
+            self._buf.assign(self._Tensor(self._buf_np))
             nt = self._v_nt.bind(n_toks)
             lg = self._prefill_jit(self._buf, sp, nt)
         logits = lg.realize().numpy().astype(np.float32)

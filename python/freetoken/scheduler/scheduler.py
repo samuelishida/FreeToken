@@ -905,7 +905,10 @@ class Scheduler(SchedulerIOMixin):
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
     needed_size = sum(r.extend_len for r in batch.padded_reqs)
-    indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
+    # pin_memory needs CUDA; the tinygrad path is CPU-only.
+    indices_host = torch.empty(
+        needed_size, dtype=torch.int32, pin_memory=device.type == "cuda"
+    )
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -920,7 +923,9 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
-    mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.empty(
+        len(batch.positions), dtype=torch.int64, pin_memory=device.type == "cuda"
+    )
     offset = 0
     for req in batch.padded_reqs:
         length = req.extend_len
@@ -931,7 +936,11 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_list = [req.table_idx for req in batch.reqs]
-    mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
+    mapping_host = torch.tensor(
+        mapping_list, dtype=torch.int64, pin_memory=device.type == "cuda"
+    )
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
-    write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
+    write_host = torch.tensor(
+        write_list, dtype=torch.int64, pin_memory=device.type == "cuda"
+    )
     return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)

@@ -683,6 +683,20 @@ def _served_model_name(state: Any) -> str:
 def _model_context_length(state: Any) -> int | None:
     """The model ceiling, not `min(ceiling, KV budget)`: a rebuild moves the latter, and agents
     read this once at startup."""
+    # tinygrad: the runner's max_context (--num-tokens, rounded up to a multiple
+    # of 128) is the real ceiling -- the model's native max position would
+    # over-report and let clients send prompts the runner cannot hold.
+    if getattr(state.config, "device", "cuda") == "tinygrad":
+        try:
+            kv_cap = getattr(state.config, "num_token_override", None) or int(
+                state.config.max_seq_len
+            )
+            value = min(int(state.config.max_seq_len), kv_cap)
+            if value % 128:
+                value = (value // 128 + 1) * 128
+            return value if value > 0 else None
+        except Exception:  # noqa: BLE001
+            return None
     try:  # never 500 a metadata route: max_seq_len walks into the HF config on some builds
         value = int(state.config.max_seq_len)
     except Exception:  # noqa: BLE001

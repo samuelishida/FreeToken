@@ -48,7 +48,10 @@ def apply_penalties(
 
 
 def make_device_tensor(data: List, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    return torch.tensor(data, dtype=dtype, pin_memory=True).to(device, non_blocking=True)
+    # pin_memory needs CUDA; the tinygrad path is CPU-only.
+    return torch.tensor(data, dtype=dtype, pin_memory=device.type == "cuda").to(
+        device, non_blocking=True
+    )
 
 
 def sample_impl(
