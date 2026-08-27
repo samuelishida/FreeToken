@@ -111,6 +111,31 @@ class Sampler:
         )
 
     @nvtx_annotate("Sampler")
+    def sample_cpu(
+        self, logits: torch.Tensor, args: BatchSamplingArgs, batch: Batch
+    ) -> torch.Tensor:
+        """Tinygrad path: logits are host-side torch CPU tensors; plain-torch sampler."""
+        if args.apply_penalties:
+            apply_penalties(logits, batch.reqs)
+        if args.temperatures is None:  # greedy
+            return torch.argmax(logits, dim=-1)
+        temps = args.temperatures.to(torch.float32)
+        probs = torch.softmax(logits / temps.unsqueeze(-1), dim=-1)
+        top_k = args.top_k if args.top_k is not None else logits.shape[-1]
+        if args.top_p is not None:
+            sorted_p, sorted_idx = probs.sort(descending=True, dim=-1)
+            cum = sorted_p.cumsum(dim=-1)
+            keep = cum - sorted_p < args.top_p.unsqueeze(-1)
+            keep = keep | (keep.cumsum(dim=-1) < top_k.unsqueeze(-1))
+            mask = torch.zeros_like(probs, dtype=torch.bool).scatter_(-1, sorted_idx, keep)
+            probs = probs * mask
+            probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
+        else:
+            probs, idx = probs.topk(int(top_k), dim=-1)
+            probs = probs / probs.sum(-1, keepdim=True).clamp_min(1e-12)
+            return idx.gather(-1, torch.multinomial(probs, 1))
+        return torch.multinomial(probs, 1).squeeze(-1)
+
     def sample(
         self, logits: torch.Tensor, args: BatchSamplingArgs, batch: Batch
     ) -> torch.Tensor:

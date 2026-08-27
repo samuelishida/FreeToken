@@ -66,9 +66,17 @@ class Scheduler(SchedulerIOMixin):
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
-        self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
-        torch.cuda.set_stream(self.stream)
+        if self.device.type == "cuda":
+            self.stream = torch.cuda.Stream(device=self.device)
+            self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
+            torch.cuda.set_stream(self.stream)
+        else:
+            # tinygrad path: no CUDA streams; force the non-overlap loop below.
+            from contextlib import nullcontext
+
+            self.stream = self.engine.stream
+            self.engine_stream_ctx = nullcontext()
+            ENV.DISABLE_OVERLAP_SCHEDULING = True
         # sent on the readiness ack for /v1/stats gpus; a list so TP can add one entry per rank
         self.gpus = [gpu_identity(self.device.index)] if self.device.type == "cuda" else []
 
@@ -129,6 +137,12 @@ class Scheduler(SchedulerIOMixin):
         # sliding-window cache chunks long prompts and frees out-of-window pages between chunks
         # instead of OOMing _alloc_window on a prompt longer than the window pool.
         _chunk_cap = self.cache_manager.prefill_chunk_budget
+        # tinygrad: the runner records one forward per batch (max_batch cap) --
+        # clamp the prefill chunk so a long prompt never asserts in the runner.
+        if getattr(config, "device", "cuda") == "tinygrad":
+            runner_cap = getattr(self.engine, "tinygrad_runner", None)
+            if runner_cap is not None:
+                _chunk_cap = min(_chunk_cap or 1 << 30, runner_cap.max_batch)
         self.prefill_budget = (
             min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
         )
@@ -163,7 +177,8 @@ class Scheduler(SchedulerIOMixin):
         """
         assert not self.prefill_manager.runnable, "rebuild requires no pending prefill"
         assert not self.decode_manager.runnable, "rebuild requires no running decode"
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
         self.engine.rebuild_runtime_cache(
@@ -295,7 +310,8 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
-        torch.cuda.synchronize(self.device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
 

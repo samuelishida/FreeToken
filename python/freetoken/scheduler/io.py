@@ -74,6 +74,8 @@ class SchedulerIOMixin:
         raise NotImplementedError("should be implemented")
 
     def sync_all_ranks(self) -> None:
+        if self.tp_cpu_group is None or self.tp_cpu_group.size() == 1:
+            return  # single-rank / tinygrad device path has no process group
         self.tp_cpu_group.barrier().wait()
 
     def _recv_msg_single_rank(self, blocking: bool = False) -> List[BaseBackendMsg]:

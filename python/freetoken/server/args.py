@@ -247,6 +247,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        choices=["cuda", "tinygrad"],
+        help=(
+            "Compute device: cuda (default) or tinygrad (AMD no-ROCm path via the "
+            "tinygrad fork's direct kfd/hsa backend)."
+        ),
+    )
+
+    parser.add_argument(
         "--max-running-requests",
         type=int,
         dest="max_running_req",
@@ -746,6 +757,15 @@ def parse_args(
                 "--moe-backend fused relies on NVIDIA-native fused GEMM; on ROCm/AMD the "
                 "supported family is offload/hybrid/cpu (the triton/offload path)."
             )
+
+    # --device tinygrad: the tinygrad Transformer is single-request stateful, so
+    # reject max_running_req > 1 at parse time (the runner also asserts).
+    if kwargs.get("device") == "tinygrad" and kwargs.get("max_running_req", 1) > 1:
+        raise SystemExit(
+            "--device tinygrad supports --max-running-requests 1 only "
+            "(the tinygrad Transformer is single-request stateful); "
+            "set FT_MAX_RUNNING_REQ=1 or pass --max-running-requests 1."
+        )
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

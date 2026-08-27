@@ -307,8 +307,61 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+class _NullStream:
+    """Stream stand-in for the tinygrad path (no CUDA streams)."""
+
+    def wait_stream(self, *a, **k):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+class _NullEvent:
+    """copy-done event stand-in: the tinygrad forward is synchronous."""
+
+    def synchronize(self):
+        pass
+
+    def record(self, *a, **k):
+        pass
+
+
+class _NullGraphRunner:
+    """Graph gate stand-in: never capturable under tinygrad."""
+
+    def can_use_cuda_graph(self, batch) -> bool:
+        return False
+
+    def pad_batch(self, batch) -> None:
+        # no CUDA-graph padding under tinygrad: the runner sees the real reqs.
+        batch.padded_reqs = batch.reqs
+
+
+class _DevicelessAttnStub:
+    """Attention-backend stand-in: the TinygradModelRunner owns KV + metadata."""
+
+    def prepare_metadata(self, batch) -> None:
+        pass
+
+    def forward(self, *a, **k):
+        raise NotImplementedError(
+            "attention runs inside TinygradModelRunner under --device tinygrad"
+        )
+
+
+class _NullKVCache:
+    sliding_window_size = None
+
+    def attach_page_table(self, *a, **k):
+        pass
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
+        if getattr(config, "device", "cuda") == "tinygrad":
+            self._init_tinygrad(config)
+            return
         assert not torch.cuda.is_initialized()
         set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
         _ensure_expandable_segments()  # before the first CUDA allocation below
@@ -930,7 +983,57 @@ class Engine:
             moe_offload_cache=self.moe_offload_cache,
         )
 
+    def _init_tinygrad(self, config: EngineConfig) -> None:
+        """Device branch for --device tinygrad: no CUDA, tinygrad owns the model."""
+        from freetoken.core import Context, set_global_ctx
+        from freetoken.distributed import set_tp_info
+
+        set_tp_info(rank=config.tp_info.rank, size=config.tp_info.size)
+        self.device = torch.device("cpu")
+        self.stream = _NullStream()
+        self.dtype = config.dtype
+        self.config = config
+        torch.manual_seed(42)
+        self.ctx = Context(config.page_size)
+        set_global_ctx(self.ctx)
+        self.tp_cpu_group = None
+        self._baseline_free = 1 << 40
+        self.max_seq_len = config.max_seq_len
+        self.num_pages = self.max_seq_len // max(1, config.page_size)
+        self.page_table = torch.zeros(
+            (config.max_running_req + 1, self.max_seq_len), dtype=torch.int32
+        )
+        self.kv_cache = _NullKVCache()
+        self.linear_state_pool = None
+        self.attn_backend = _DevicelessAttnStub()
+        self.moe_offload_cache = None
+        self.cpu_moe_executor = None
+        self.graph_runner = _NullGraphRunner()
+        from freetoken.engine.sample import Sampler
+
+        self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        from freetoken.engine.tinygrad_runner import TinygradModelRunner
+
+        # The runner's KV/state are sized to max_len: use the KV capacity
+        # (--num-tokens) when it is smaller than the model's max position, so a
+        # small KV config actually shrinks the VRAM footprint.
+        kv_cap = getattr(config, "num_token_override", None) or self.max_seq_len
+        self.tinygrad_runner = TinygradModelRunner(
+            config.model_path, config.model_config,
+            max_batch=256, max_len=min(self.max_seq_len, kv_cap),
+            max_slots=max(1, config.max_running_req),
+        )
+        self.ctx.tinygrad_runner = self.tinygrad_runner
+
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
+        if getattr(self.config, "device", "cuda") == "tinygrad":
+            with self.ctx.forward_batch(batch):
+                logits = self.tinygrad_runner.forward(batch)
+            for req in batch.reqs:
+                req.complete_one()
+            next_tokens = self.sampler.sample_cpu(logits, args, batch)
+            next_tokens = next_tokens.to(torch.int32)
+            return ForwardOutput(next_tokens, next_tokens, _NullEvent())
         assert torch.cuda.current_stream() == self.stream
         with self.ctx.forward_batch(batch):
             if self.graph_runner.can_use_cuda_graph(batch):
@@ -1010,6 +1113,9 @@ class Engine:
         )
 
     def shutdown(self) -> None:
+        if getattr(self.config, "device", "cuda") == "tinygrad":
+            self.tinygrad_runner.close()
+            return
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()

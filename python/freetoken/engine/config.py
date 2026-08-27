@@ -18,6 +18,9 @@ class EngineConfig:
     model_path: str
     tp_info: DistributedInfo
     dtype: torch.dtype
+    # Compute device: cuda (default) or tinygrad (AMD no-ROCm path via the
+    # tinygrad fork's direct kfd/hsa backend).
+    device: str = "cuda"
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_backend: str = "auto"

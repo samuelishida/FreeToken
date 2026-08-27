@@ -1,0 +1,119 @@
+"""TinygradModelRunner: FreeToken engine seam over tinygrad's Transformer.
+
+``--device tinygrad`` runs the model through the tinygrad fork's AMD backend
+(direct kfd/hsa ioctls -- no ROCm userspace, no Vulkan). The runner owns ONE
+``Transformer`` instance (single-request stateful: per-block KV cache +
+GatedDeltaNet recurrent state) and maps FreeToken batches to
+``model.logits()`` calls.
+
+Scope: ``max_running_req=1`` (the scheduler serializes requests; the tinygrad
+Transformer is batch=1). Multi-request is a future extension.
+
+JIT notes (mirrors ``Transformer.generate``):
+- ``start_pos`` and the prefill token count are UOp variables bound at the
+  call site, so the AMD flash kernels see symbolic shapes. The prefill flash
+  kernel pads the query tile to a multiple of BLOCK_M=32 internally and
+  slices garbage rows off; the decode kernel requires ``max_context % 128 == 0``
+  (block_n=128), so the runner rounds ``max_len`` up to a multiple of 128.
+- The bind must happen OUTSIDE the JIT'd function (like ``generate``), or the
+  JIT's variable bookkeeping breaks on the second decode call.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from freetoken.core import Batch
+
+
+class TinygradModelRunner:
+    def __init__(
+        self,
+        model_path: str,
+        model_config,
+        max_len: int,
+        max_batch: int = 256,
+        max_slots: int = 1,
+    ) -> None:
+        if max_slots > 1:
+            raise NotImplementedError(
+                "--device tinygrad supports max_running_req=1 only "
+                "(the tinygrad Transformer is single-request stateful)"
+            )
+        from tinygrad import Tensor, TinyJit, UOp
+        from tinygrad.llm.model import Transformer
+
+        # AMD flash decode kernel: max_kv_len % block_n(128) == 0.
+        max_context = max_len
+        if max_context % 128:
+            max_context = (max_context // 128 + 1) * 128
+        self.max_len = max_context
+        self.max_batch = max_batch
+        self.vocab_size = model_config.vocab_size
+
+        self.model, self._kv = Transformer.from_gguf(
+            model_path, max_context=max_context
+        )
+        self._Tensor = Tensor
+
+        # JIT specialization: symbolic start_pos + prefill token count, bound at
+        # the call site (see module docstring).
+        self._v_sp = UOp.variable("start_pos", 0, max_context - 1)
+        self._v_nt = UOp.variable("n_toks", 1, max_batch)
+        self._buf = Tensor.zeros(1, max_context, dtype="int32")
+
+        def _prefill(tokens_buf, sp, nt):
+            return self.model.logits(tokens_buf[:, sp : sp + nt], sp)
+
+        def _decode(tokens, sp):
+            return self.model.logits(tokens, sp)
+
+        self._prefill_jit = TinyJit(_prefill)
+        self._decode_jit = TinyJit(_decode)
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """Compile both JIT graphs and realize the weights once at init."""
+        self._buf.assign(
+            self._Tensor([[0]], dtype="int32").pad_to((1, self.max_len))
+        )
+        sp, nt = self._v_sp.bind(0), self._v_nt.bind(1)
+        lg = self._prefill_jit(self._buf, sp, nt).realize()
+        sp = self._v_sp.bind(1)
+        self._decode_jit(
+            self._Tensor([[int(lg.argmax().item())]], dtype="int32"), sp
+        ).realize()
+
+    def forward(self, batch: Batch) -> torch.Tensor:
+        """Logits [nreq, V] (last token of each req's extend) as a CPU tensor.
+
+        Mirrors ``VulkanModelRunner.forward``'s return contract: one row per
+        request, the logits of the last token of the request's extend, which
+        ``sample_cpu`` + the scheduler's ``_process_last_data`` consume.
+        """
+        assert len(batch.reqs) == 1, "tinygrad runner: max_running_req=1 only"
+        req = batch.reqs[0]
+        cached_len = req.cached_len
+        device_len = req.device_len
+        if device_len <= cached_len:
+            # Empty extend: the scheduler never sends it; return zeros defensively.
+            return torch.zeros((1, self.vocab_size), dtype=torch.float32)
+
+        ids = batch.input_ids[cached_len:device_len].cpu().numpy().astype(np.int32)
+        n_toks = device_len - cached_len
+        sp = self._v_sp.bind(cached_len)
+        if n_toks == 1:
+            lg = self._decode_jit(self._Tensor(ids.reshape(1, 1)), sp)
+        else:
+            self._buf.assign(
+                self._Tensor(ids.reshape(1, -1)).pad_to((1, self.max_len))
+            )
+            nt = self._v_nt.bind(n_toks)
+            lg = self._prefill_jit(self._buf, sp, nt)
+        logits = lg.realize().numpy().astype(np.float32)
+        return torch.from_numpy(logits)
+
+    def close(self) -> None:
+        self.model = None
+        self._kv = None
