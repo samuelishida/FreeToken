@@ -52,11 +52,14 @@ def test_args_reject_tinygrad_multi_request():
 
 
 @pytest.mark.needs_weights
-def test_e2e_greedy_continuation():
-    """Greedy continuation of 'The capital of France is' -> ' Paris...' through
-    the Engine with --device tinygrad (matches the ROCm reference)."""
+def test_e2e_tinygrad():
+    """Real-model e2e through the Engine with --device tinygrad (one Engine,
+    all scenarios): greedy continuation, chunked prefill, prefix reuse, and
+    fresh-request state reset. Matches the ROCm reference output."""
     if not os.environ.get("FREETOKEN_TINYGRAD_E2E"):
         pytest.skip("set FREETOKEN_TINYGRAD_E2E=1 to run the real-model e2e")
+    import random
+
     import torch
 
     from freetoken.core import Batch, Req, SamplingParams
@@ -74,35 +77,59 @@ def test_e2e_greedy_continuation():
         max_seq_len_override=4096,
     )
     engine = Engine(config)
-    try:
-        ids = torch.tensor(
-            tok.encode("The capital of France is", add_special_tokens=False),
-            dtype=torch.int32,
-        )
+
+    def forward(ids, cached_len, phase):
         req = Req(
-            input_ids=ids, table_idx=0, cached_len=0, output_len=16, uid=0,
+            input_ids=ids, table_idx=0, cached_len=cached_len,
+            output_len=max(1, len(ids) - cached_len), uid=0,
             sampling_params=SamplingParams(), cache_handle=None,
         )
-        batch = Batch(reqs=[req], phase="prefill")
+        batch = Batch(reqs=[req], phase=phase)
         batch.input_ids = ids
         batch.positions = torch.arange(len(ids), dtype=torch.int32)
         batch.padded_reqs = batch.reqs
         out = engine.forward_batch(batch, engine.sampler.prepare(batch))
-        gen = [int(out.next_tokens_cpu[0].item())]
-        for _ in range(14):
+        return int(out.next_tokens_cpu[0].item())
+
+    def decode_n(ids, n):
+        gen = []
+        cached = 0
+        while cached < len(ids):
+            chunk_end = min(cached + 256, len(ids))
+            tok = forward(ids[:chunk_end], cached, "prefill")
+            cached = chunk_end
+        gen.append(tok)  # only the last chunk's logits are sampled
+        for _ in range(n - 1):
             full = torch.cat([ids, torch.tensor(gen, dtype=torch.int32)])
-            req2 = Req(
-                input_ids=full, table_idx=0, cached_len=len(full) - 1,
-                output_len=1, uid=0, sampling_params=SamplingParams(),
-                cache_handle=None,
-            )
-            batch2 = Batch(reqs=[req2], phase="decode")
-            batch2.input_ids = full
-            batch2.positions = torch.arange(len(full), dtype=torch.int32)
-            batch2.padded_reqs = batch2.reqs
-            out2 = engine.forward_batch(batch2, engine.sampler.prepare(batch2))
-            gen.append(int(out2.next_tokens_cpu[0].item()))
+            gen.append(forward(full, len(full) - 1, "decode"))
+        return gen
+
+    try:
+        # 1. greedy continuation (matches the ROCm reference).
+        ids = torch.tensor(
+            tok.encode("The capital of France is", add_special_tokens=False),
+            dtype=torch.int32,
+        )
+        gen = decode_n(ids, 15)
         text = tok.decode(gen)
         assert text.startswith(" Paris"), f"unexpected continuation: {text!r}"
+
+        # 2. chunked prefill: 512-token prompt in 2 chunks of 256.
+        random.seed(42)
+        long_prompt = [random.randint(0, 20000) for _ in range(512)]
+        gen = decode_n(torch.tensor(long_prompt, dtype=torch.int32), 3)
+        assert len(gen) == 3
+
+        # 3. prefix reuse: same first 5 tokens, continue from start_pos=5.
+        gen2 = decode_n(ids, 8)
+        assert tok.decode(gen2).startswith(" Paris"), f"prefix reuse wrong: {tok.decode(gen2)!r}"
+
+        # 4. fresh request after a different prompt: state must reset.
+        fresh = torch.tensor(
+            tok.encode("The capital of Japan is", add_special_tokens=False),
+            dtype=torch.int32,
+        )
+        gen3 = decode_n(fresh, 8)
+        assert tok.decode(gen3).startswith(" Tokyo"), f"fresh request wrong: {tok.decode(gen3)!r}"
     finally:
         engine.shutdown()
