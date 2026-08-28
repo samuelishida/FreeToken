@@ -80,6 +80,15 @@ chunks, the scheduler's cap); decode is single-token steps.
   `allocator.free_cache()` post-warmup in the runner).
 - decode graph: 57 kernels (54 + the quantize path).
 
+## Inc 4/Inc 5 (decode GEMM) — 2026-08-28
+
+- Inc 4 (`4b5f8188d`..`b319c90d6`): qsum precomputed in q8_quantize; the Q4_K/Q5_K
+  decode dp4a kernel reads it (bit-identical, -8 dp4a/group/output). Decode flat
+  at 4K (18.1) — the dp4a chain wasn't the bottleneck.
+- Inc 5 (`58584a056`): tokens=1 GEMMs ride the WMMA kernel (activation zero-padded
+  to the 16-row tile, padded rows sliced off); the q8 activation quantize leaves
+  the decode path entirely.
+
 Prefill is MoE-bound but the flash kernels keep it ~150 tok/s; decode is
 ~9-17 tok/s (MoE expert routing dominates). The first request after startup
 pays no recompile (the runner warms both JIT graphs at init).
