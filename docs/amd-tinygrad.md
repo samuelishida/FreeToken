@@ -152,6 +152,26 @@ cache to 8-bit restores ~1.3 GB, bringing headroom to ~1.6 GB.
   tinygrad cache warm (do not run with a different max_context casually —
   each new max_context recompiles the whole graph).
 
+## Decode overhead breakdown (Inc 1, 2026-08-28)
+
+`scripts/decode-overhead-tinygrad.py --model ... --ctx 4096 --steps 30` (4K, JIT quente):
+
+| componente | mediana ms |
+|---|---|
+| full forward_batch | 58.6 |
+|  ├─ H2D do token (input) | ~13  |
+|  ├─ dispatch JIT (Python) | ~1.5 |
+|  ├─ GPU (7 batched n_calls) | ~32-40 |
+|  └─ D2H logits (608 KB, sync incluso) | ~1 |
+
+- CORREÇÃO do diagnóstico anterior: o decode é **GPU-bound pelos GEMMs MoE de
+  experts** (batched 64/128/256/512 → 1.3/4.4/8.6/17.5 ms no trace), a ~130 GB/s
+  efetivos vs 960 do cartão. Os kernels customizados (WMMA/dp4a do decode) não
+  cobrem o matmul de experts (tokens=8, gather `weight[sel]` + matmul genérico).
+- O "39.2 ms de dispatch" anotado antes era o sync de GPU escondido (medição
+  async) — o dispatch Python real é ~1.5 ms.
+- O H2D do token (13 ms/passo, custo fixo) é a segunda maior alavanca.
+
 ## Known limits
 
 - Prefill throughput (~150 tok/s) and decode (~15 tok/s) are the practical
