@@ -2,13 +2,9 @@
 
 `--device tinygrad` runs the model through the **tinygrad fork's** inference
 stack on AMD (RX 7900 XTX / gfx1100). The tinygrad AMD backend talks directly
-to the kernel driver (kfd/hsa/amdgpu_drm ioctls) — **no ROCm userspace, no
-Vulkan**. FreeToken's engine (scheduler, sampler, OpenAI API) stays; model
-execution goes through tinygrad's `Transformer`.
-
-This replaces the earlier custom Vulkan path (`--device vulkan`), which was
-removed. The Vulkan work lives on the `feat/amd-vulkan-support` branch for
-history.
+to the kernel driver (kfd/hsa/amdgpu_drm ioctls) — **no ROCm userspace**.
+FreeToken's engine (scheduler, sampler, OpenAI API) stays; model execution
+goes through tinygrad's `Transformer`.
 
 ## How it works
 
@@ -51,8 +47,15 @@ the AMD kernels, and the public `Transformer.logits()` method.
 ## Usage
 
 ```bash
-FT_MODEL=/path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf ./scripts/serve-tinygrad.sh
+./scripts/serve-tinygrad.sh --model /path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf
 # then point Copilot / any OpenAI client at http://127.0.0.1:1920/v1
+```
+
+The profiling scripts also take `--model` via launch args (no env vars):
+
+```bash
+.venv-rocm/bin/python scripts/bench-tinygrad.py --model /path/to/model.gguf --kernels
+.venv-rocm/bin/python scripts/vram-tinygrad.py --model /path/to/model.gguf
 ```
 
 ## Benchmarks (RX 7900 XTX, gfx1100, Qwen3.6-35B-A3B-UD-Q4_K_M.gguf)
