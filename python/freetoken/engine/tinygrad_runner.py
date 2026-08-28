@@ -21,6 +21,8 @@ JIT notes (mirrors ``Transformer.generate``):
 
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import torch
 
@@ -78,16 +80,23 @@ class TinygradModelRunner:
         self._warmup()
 
     def _warmup(self) -> None:
-        """Compile both JIT graphs and realize the weights once at init."""
-        self._buf.assign(
-            self._Tensor([[0]], dtype="int32").pad_to((1, self.max_len))
-        )
-        sp, nt = self._v_sp.bind(0), self._v_nt.bind(1)
-        lg = self._prefill_jit(self._buf, sp, nt).realize()
-        sp = self._v_sp.bind(1)
-        self._decode_jit(
-            self._Tensor([[int(lg.argmax().item())]], dtype="int32"), sp
-        ).realize()
+        """Compile both JIT graphs and realize the weights once at init.
+
+        TinyJit's first call is eager, the second captures, the third executes;
+        the warmup runs each JIT twice with the real request shapes (256-token
+        prefill chunk + decode at a non-trivial position) so the first request
+        doesn't pay a recompile.
+        """
+        warm = np.array([random.randint(0, 1000) for _ in range(256)], dtype=np.int32)
+        self._buf_np[0, :256] = warm
+        self._buf.assign(self._Tensor(self._buf_np))
+        sp, nt = self._v_sp.bind(0), self._v_nt.bind(256)
+        lg = self._prefill_jit(self._buf, sp, nt).realize()  # eager
+        lg = self._prefill_jit(self._buf, sp, nt).realize()  # capture
+        sp = self._v_sp.bind(256)
+        tok = np.array([[int(lg.argmax().item())]], dtype=np.int32)
+        self._decode_jit(self._Tensor(tok), sp).realize()  # eager
+        self._decode_jit(self._Tensor(tok), sp).realize()  # capture
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Logits [nreq, V] (last token of each req's extend) as a CPU tensor.

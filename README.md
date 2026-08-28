@@ -55,6 +55,7 @@ For More details:
 - [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
+- [AMD via tinygrad](https://github.com/FlashML-org/FreeToken/blob/main/docs/amd-tinygrad.md)
 
 ## Citation
 
