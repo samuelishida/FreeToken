@@ -82,9 +82,9 @@ Measured with `scripts/bench-tinygrad.py --kernels` and
 |-----------|----------|
 | weights   | 22.13 GB |
 | kv        | 2.68 GB  |
-| gdn_state | 0.06 GB  |
+| gdn_state | 0.03 GB  (Inc 2: fp16 state, was 0.06 fp32) |
 | remainder | 0.51 GB  (activations + JIT graphs) |
-| **free**  | **0.36 GB — HEADROOM GATE FAILS (< 1 GB)** |
+| **free**  | **0.39 GB — HEADROOM GATE FAILS (< 1 GB)** (Inc 2: +30 MB vs fp32 state) |
 
 The gate failure is the motivation for Inc 3 (KV Q8): quantizing the KV
 cache to 8-bit restores ~1.3 GB, bringing headroom to ~1.6 GB.
