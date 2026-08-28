@@ -89,21 +89,21 @@ chunks, the scheduler's cap); decode is single-token steps.
   to the 16-row tile, padded rows sliced off); the q8 activation quantize leaves
   the decode path entirely.
 
-## Resultado final (Inc 5) — plano kernel-opt completo
+## Final result (Inc 5) — kernel-opt plan complete
 
-| ctx    | prefill (base → final) | decode (base → final) |
-|--------|------------------------|------------------------|
-| 4K     | 152.0 → 153.8          | 16.5 → 18.2 (+10%)     |
-| 16K    | 149.1 → 150.8          | 15.9 → 17.9 (+13%)     |
-| 64K    | 141.1 → 143.2          | 12.3 → 15.0 (+22%)     |
-| 128K   | 133.2 → 134.3          | 9.5 → 15.7 (+65%)      |
+| ctx  | prefill (base → final) | decode (base → final) |
+|------|------------------------|------------------------|
+| 4K   | 152.0 → 153.8          | 16.5 → 18.2 (+10%)     |
+| 16K  | 149.1 → 150.8          | 15.9 → 17.9 (+13%)     |
+| 64K  | 141.1 → 143.2          | 12.3 → 15.0 (+22%)     |
+| 128K | 133.2 → 134.3          | 9.5 → 15.7 (+65%)      |
 
-- VRAM 128K: 25.39 → 24.17 GB usados; headroom 0.36 → **1.59 GB (gate ≥ 1 GB ✓)**.
-- O ganho do decode veio do KV Q8 (8× menos banda de KV por token). Os GEMMs do
-  decode (dp4a → WMMA) ficaram flat: o decode é bound em banda de PESOS
-  (~350 GB/s efetivos — o gap até os 960 GB/s do cartão está no padrão de leitura
-  dos experts MoE, fora do escopo dos kernels).
-- Qualidade: e2e " Paris", prefix reuse e state reset passam em todos os incrementos.
+- 128K VRAM: 25.39 → 24.17 GB used; headroom 0.36 → **1.59 GB (gate ≥ 1 GB ✓)**.
+- Decode gains came from KV Q8 (8× less KV bandwidth per token). Decode GEMMs
+  (dp4a → WMMA) were flat: decode is weight-bandwidth bound (~350 GB/s effective
+  vs the card's 960 GB/s — the gap is the MoE expert read pattern, outside the
+  kernel scope).
+- Quality: e2e " Paris", prefix reuse and state reset pass in every increment.
 
 Prefill is MoE-bound but the flash kernels keep it ~150 tok/s; decode is
 ~9-17 tok/s (MoE expert routing dominates). The first request after startup

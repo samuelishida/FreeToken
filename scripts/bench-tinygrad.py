@@ -6,17 +6,21 @@ scheduler's cap); decode is measured as single-token steps at the given
 context length.
 
 Usage:
-  .venv-rocm/bin/python scripts/bench-tinygrad.py [--ctx 4096,16384,65536,131072]
+  .venv-rocm/bin/python scripts/bench-tinygrad.py --model /path/to/model.gguf
+                              [--ctx 4096,16384,65536,131072]
                               [--decode 20] [--kernels]
 
 --kernels also reports the number of captured kernels per decode step
 (counted from the JIT's captured graph; falls back to wall-clock only if the
 internal API is unavailable).
 """
+from __future__ import annotations
+
+import argparse
+import random
 import sys
 import time
-import random
-import argparse
+from typing import Optional
 
 import torch
 
@@ -26,13 +30,11 @@ from freetoken.distributed import DistributedInfo
 from freetoken.engine import Engine, EngineConfig
 from freetoken.utils import load_tokenizer
 
-P = "/media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 
-
-def make_engine(max_seq_len_override: int) -> Engine:
-    tok = load_tokenizer(P)
+def make_engine(model_path: str, max_seq_len_override: int) -> Engine:
+    tok = load_tokenizer(model_path)
     config = EngineConfig(
-        model_path=P,
+        model_path=model_path,
         tp_info=DistributedInfo(0, 1),
         dtype=torch.float16,
         device="tinygrad",
@@ -43,7 +45,13 @@ def make_engine(max_seq_len_override: int) -> Engine:
     return engine
 
 
-def forward(engine, full_ids, extend, cached_len, phase):
+def forward(
+    engine: Engine,
+    full_ids: torch.Tensor,
+    extend: torch.Tensor,
+    cached_len: int,
+    phase: str,
+) -> int:
     req = Req(
         input_ids=full_ids,
         table_idx=0,
@@ -63,7 +71,7 @@ def forward(engine, full_ids, extend, cached_len, phase):
     return int(out.next_tokens_cpu[0].item())
 
 
-def prefill_toks(engine, ids):
+def prefill_toks(engine: Engine, ids: torch.Tensor) -> tuple[float, int]:
     """Chunked prefill of ids; returns (elapsed, n_tokens)."""
     cached = 0
     t0 = time.monotonic()
@@ -74,9 +82,11 @@ def prefill_toks(engine, ids):
     return time.monotonic() - t0, len(ids)
 
 
-def decode_toks(engine, ids, n=20):
+def decode_toks(
+    engine: Engine, ids: torch.Tensor, n: int = 20
+) -> tuple[float, int]:
     """n single-token decode steps after prefill; returns (elapsed, n)."""
-    gen = []
+    gen: list[int] = []
     cached = 0
     while cached < len(ids):
         chunk_end = min(cached + 256, len(ids))
@@ -90,7 +100,7 @@ def decode_toks(engine, ids, n=20):
     return time.monotonic() - t0, n
 
 
-def decode_kernel_count(engine):
+def decode_kernel_count(engine: Engine) -> Optional[int]:
     """Number of kernels in the captured decode JIT graph, or None."""
     try:
         from tinygrad.uop.ops import Ops
@@ -104,8 +114,9 @@ def decode_kernel_count(engine):
         return None
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, help="path to the GGUF model")
     ap.add_argument("--ctx", default="4096,16384,65536,131072")
     ap.add_argument("--decode", type=int, default=20)
     ap.add_argument("--kernels", action="store_true")
@@ -117,7 +128,7 @@ def main():
     # kernels are cached per-shape. Using 131584 here would recompile the
     # whole graph on a cold start.
     max_seq_len_override = ((max(ctxs) + 127) // 128) * 128
-    engine = make_engine(max_seq_len_override)
+    engine = make_engine(args.model, max_seq_len_override)
     print("engine ready (JIT warm); runner max_len =", engine.tinygrad_runner.max_len)
 
     if args.kernels:

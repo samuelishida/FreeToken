@@ -21,6 +21,7 @@ JIT notes (mirrors ``Transformer.generate``):
 
 from __future__ import annotations
 
+import logging
 import random
 
 import numpy as np
@@ -105,8 +106,8 @@ class TinygradModelRunner:
 
             dev = next(iter(get_state_dict(self.model).values())).device
             Device[dev].allocator.free_cache()
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.debug("tinygrad_runner: free_cache() failed: %s", exc)
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Logits [nreq, V] (last token of each req's extend) as a CPU tensor.

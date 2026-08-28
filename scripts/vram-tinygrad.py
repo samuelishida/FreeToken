@@ -6,11 +6,16 @@ the remainder (activations + overhead). Enforces the project's hard constraint:
 free VRAM must stay >= 1 GB (headroom), exiting non-zero otherwise.
 
 Usage:
-  .venv-rocm/bin/python scripts/vram-tinygrad.py [--max-len 131072] [--no-gate]
+  .venv-rocm/bin/python scripts/vram-tinygrad.py --model /path/to/model.gguf
+                              [--max-len 131072] [--no-gate]
 """
-import sys
-import glob
+from __future__ import annotations
+
 import argparse
+import glob
+import os
+import sys
+from typing import Optional
 
 import torch
 
@@ -18,11 +23,10 @@ sys.path.insert(0, "python")
 from freetoken.distributed import DistributedInfo
 from freetoken.engine import Engine, EngineConfig
 
-P = "/media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
 MIN_HEADROOM_GB = 1.0
 
 
-def amdgpu_sysfs():
+def amdgpu_sysfs() -> tuple[int, int] | None:
     """Auto-detect the amdgpu render device and read VRAM used/total (bytes).
 
     Returns (used, total) or None if no sysfs entry is present (non-amdgpu /
@@ -38,11 +42,11 @@ def amdgpu_sysfs():
     return None
 
 
-def state_dict_nbytes(model):
+def state_dict_nbytes(model) -> dict[str, int]:
     """Walk the model's tensors (name -> nbytes), skipping non-device bufs."""
     from tinygrad.nn.state import get_state_dict
 
-    out = {}
+    out: dict[str, int] = {}
     for name, t in get_state_dict(model).items():
         try:
             out[name] = t.nbytes()
@@ -51,30 +55,29 @@ def state_dict_nbytes(model):
     return out
 
 
-def breakdown(engine):
+def breakdown(engine: Engine, model_path: str) -> dict[str, int]:
     """dict of category -> bytes. Weights use the GGUF file size (the packed
     Q4_K_M footprint); the state-dict nbytes() over-counts quantized weights
     by reporting their logical fp16 size. KV / GDN state are counted from
     their (unquantized) tensors."""
-    import os
-
     model = engine.tinygrad_runner.model
     tensors = state_dict_nbytes(model)
     kv = sum(v for k, v in tensors.items() if "cache_kv" in k)
     state = sum(v for k, v in tensors.items() if "recurrent_state" in k)
-    weights = os.path.getsize(P)
+    weights = os.path.getsize(model_path)
     return {"weights": weights, "kv": kv, "gdn_state": state, "misc": 0}
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, help="path to the GGUF model")
     ap.add_argument("--max-len", type=int, default=131072)
     ap.add_argument("--no-gate", action="store_true", help="skip the headroom exit")
     args = ap.parse_args()
 
     engine = Engine(
         EngineConfig(
-            model_path=P,
+            model_path=args.model,
             tp_info=DistributedInfo(0, 1),
             dtype=torch.float16,
             device="tinygrad",
@@ -83,7 +86,7 @@ def main():
         )
     )
 
-    b = breakdown(engine)
+    b = breakdown(engine, args.model)
     sysfs = amdgpu_sysfs()
     if sysfs is not None:
         used, total = sysfs
