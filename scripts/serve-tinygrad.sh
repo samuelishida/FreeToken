@@ -107,16 +107,21 @@ VS Code Copilot config (chatLanguageModels.json):
   "FreeToken-Tinygrad": {
     "url": "http://$HOST:$PORT/v1/chat/completions",
     "model": "$SERVED_MODEL",
-    "maxInputTokens": 4096,
-    "maxOutputTokens": 512
+    "maxInputTokens": 65536,
+    "maxOutputTokens": 65536
   }
 }
 
 Notes:
-- maxInputTokens is what Copilot sends as context; 4096 prefills in ~27 s at
-  ~150 tok/s. Raise it to use more of the $KV_TOKENS-token context (prefill
-  time scales linearly).
-- The server reports max_context=$KV_TOKENS via /v1/models.
+- The server's max_context=$KV_TOKENS is TOTAL (input + output). 64K input +
+  64K output = 128K; raise maxInputTokens only by lowering maxOutputTokens.
+- maxInputTokens must stay above ~25K: Copilot's Agent mode injects tool
+  schemas (~25K tokens) and its token-pruning crashes below that
+  ("No lowest priority node found", microsoft/vscode#322299).
+- Prefill scales linearly: 64K input at ~150 tok/s is ~7 min. Use Ask mode
+  (no tools) for quick turns.
+- After editing the config: new chat (don't reuse an errored one) and
+  reload the window.
 EOF
         exit 0
         ;;
