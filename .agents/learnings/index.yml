@@ -1,0 +1,6 @@
+tinygrad-runner-jit:
+  file: tinygrad-runner-jit.md
+  description: The tinygrad runner's JIT pattern (bind UOp variables outside the JIT'd function, two JITs, warmup twice, public logits() in the fork, max_context % 128). Read before touching engine/tinygrad_runner.py or the fork's model API.
+freetoken-device-seam:
+  file: freetoken-device-seam.md
+  description: The non-CUDA device seam (batch.input_ids is the extend, pin_memory guards, max_seq_len from the runner, sync_all_ranks no-op). Read before adding another non-CUDA device or touching scheduler batch plumbing.
