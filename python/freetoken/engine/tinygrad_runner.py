@@ -97,6 +97,16 @@ class TinygradModelRunner:
         tok = np.array([[int(lg.argmax().item())]], dtype=np.int32)
         self._decode_jit(self._Tensor(tok), sp).realize()  # eager
         self._decode_jit(self._Tensor(tok), sp).realize()  # capture
+        # Return the eager warmup's cached scratch to the driver (~0.6 GB of
+        # allocator LRU): the VRAM headroom gate needs it at 128K context.
+        try:
+            from tinygrad import Device
+            from tinygrad.nn.state import get_state_dict
+
+            dev = next(iter(get_state_dict(self.model).values())).device
+            Device[dev].allocator.free_cache()
+        except Exception:
+            pass
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Logits [nreq, V] (last token of each req's extend) as a CPU tensor.

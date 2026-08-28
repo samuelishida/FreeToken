@@ -67,6 +67,19 @@ chunks, the scheduler's cap); decode is single-token steps.
 | 64K      | 141.1        | 12.3         |
 | 128K     | 133.2        | 9.5          |
 
+## Inc 3 (KV Q8) results — 2026-08-28
+
+| context  | prefill tok/s | decode tok/s | decode vs fp16-KV |
+|----------|--------------|--------------|-------------------|
+| 4K       | 153.5        | 18.2         | +10%  |
+| 16K      | 150.6        | 17.7         | +11%  |
+| 64K      | 143.2        | 15.4         | +25%  |
+| 128K     | 135.1        | 15.3         | +61%  |
+
+- kv: 2.68 → 1.51 GB; headroom 0.39 → 1.59 GB (gate PASSES after
+  `allocator.free_cache()` post-warmup in the runner).
+- decode graph: 57 kernels (54 + the quantize path).
+
 Prefill is MoE-bound but the flash kernels keep it ~150 tok/s; decode is
 ~9-17 tok/s (MoE expert routing dominates). The first request after startup
 pays no recompile (the runner warms both JIT graphs at init).
@@ -84,7 +97,7 @@ Measured with `scripts/bench-tinygrad.py --kernels` and
 | kv        | 2.68 GB  |
 | gdn_state | 0.03 GB  (Inc 2: fp16 state, was 0.06 fp32) |
 | remainder | 0.51 GB  (activations + JIT graphs) |
-| **free**  | **0.39 GB — HEADROOM GATE FAILS (< 1 GB)** (Inc 2: +30 MB vs fp32 state) |
+| **free**  | **1.59 GB — GATE PASSES** (Inc 3 KV Q8 +1.17 GB; free_cache pós-warmup +0.64) |
 
 The gate failure is the motivation for Inc 3 (KV Q8): quantizing the KV
 cache to 8-bit restores ~1.3 GB, bringing headroom to ~1.6 GB.
