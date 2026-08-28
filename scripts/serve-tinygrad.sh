@@ -16,12 +16,13 @@
 #     pays no recompile.
 #
 # Usage:
-#   ./serve-tinygrad.sh                 # launch on 127.0.0.1:1920
+#   ./serve-tinygrad.sh                 # launch on 127.0.0.1:1920, 128K context
 #   FT_MODEL=/path/to/model.gguf ./serve-tinygrad.sh
 #   FT_PORT=1930 ./serve-tinygrad.sh    # pick another port
-#   FT_KV_TOKENS=131072 ./serve-tinygrad.sh   # bigger context (VRAM permitting)
+#   FT_KV_TOKENS=32768 ./serve-tinygrad.sh   # smaller context (VRAM sharing)
 #   ./serve-tinygrad.sh status          # running? + tail of the log
 #   ./serve-tinygrad.sh test            # one chat request against the server
+#   ./serve-tinygrad.sh copilot         # print the VS Code Copilot config
 #   ./serve-tinygrad.sh stop            # kill the server AND free its VRAM
 
 set -euo pipefail
@@ -34,8 +35,13 @@ MODEL="${FT_MODEL:-/media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models/Qwen3.
 HOST="${FT_HOST:-127.0.0.1}"
 PORT="${FT_PORT:-1920}"
 # max_context in tokens (rounded up to a multiple of 128 by the runner).
-KV_TOKENS="${FT_KV_TOKENS:-32768}"
+# 128K default: 22 GB weights + fp16 KV (~2.6 GB at 128K for this model's 10
+# full-attn layers) + recurrent state fits the 24 GiB card; drop to 32768 with
+# FT_KV_TOKENS if another process shares the GPU.
+KV_TOKENS="${FT_KV_TOKENS:-131072}"
 MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
+# Stable model id served to clients (Copilot's "model" field).
+SERVED_MODEL="${FT_SERVED_MODEL:-qwen3.6}"
 LOG="${FT_LOG:-/tmp/serve_tinygrad.log}"
 PIDFILE="${FT_PIDFILE:-/tmp/serve_tinygrad.pid}"
 
@@ -92,6 +98,28 @@ case "${1:-}" in
             | python3 -c "import sys,json; d=json.load(sys.stdin); print('  content:', repr(d['choices'][0]['message'].get('content',''))); print('  finish:', d['choices'][0]['finish_reason'])"
         exit 0
         ;;
+    copilot)
+        # Print the exact VS Code Copilot config for this server.
+        cat <<EOF
+VS Code Copilot config (chatLanguageModels.json):
+
+{
+  "FreeToken-Tinygrad": {
+    "url": "http://$HOST:$PORT/v1/chat/completions",
+    "model": "$SERVED_MODEL",
+    "maxInputTokens": 4096,
+    "maxOutputTokens": 512
+  }
+}
+
+Notes:
+- maxInputTokens is what Copilot sends as context; 4096 prefills in ~27 s at
+  ~150 tok/s. Raise it to use more of the $KV_TOKENS-token context (prefill
+  time scales linearly).
+- The server reports max_context=$KV_TOKENS via /v1/models.
+EOF
+        exit 0
+        ;;
 esac
 
 # Refuse to double-launch.
@@ -99,9 +127,9 @@ if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     die "already running (pid $(cat "$PIDFILE")); use '$0 stop' first"
 fi
 
-echo "serving $MODEL on $HOST:$PORT (max_context=$KV_TOKENS)"
+echo "serving $MODEL on $HOST:$PORT (max_context=$KV_TOKENS, model id '$SERVED_MODEL')"
 echo "  log: $LOG   (startup ~2.5 min: model load + JIT warmup)"
-echo "  status: $0 status | test: $0 test | stop: $0 stop"
+echo "  status: $0 status | test: $0 test | copilot: $0 copilot | stop: $0 stop"
 
 # Launch detached; record the launcher PID. The scheduler subprocess is killed
 # by `stop` (see _stop).
@@ -111,6 +139,7 @@ nohup "$PY" -m freetoken.cli serve \
     --max-running-requests 1 \
     --num-tokens "$KV_TOKENS" \
     --max-output-tokens "$MAX_OUTPUT" \
+    --served-model-name "$SERVED_MODEL" \
     --host "$HOST" \
     --port "$PORT" \
     >>"$LOG" 2>&1 &
