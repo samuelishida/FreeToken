@@ -172,6 +172,24 @@ cache to 8-bit restores ~1.3 GB, bringing headroom to ~1.6 GB.
   async) — o dispatch Python real é ~1.5 ms.
 - O H2D do token (13 ms/passo, custo fixo) é a segunda maior alavanca.
 
+## Rangeify fixes (variable-T + start_pos simbólico) — 2026-08-28
+
+O `get_kernel_graph` do fork (o gerador de grafo de kernel via rangeify)
+crashava em 2 pontos com extensões simbólicas:
+- `IndexError` no `ended` comprehension (indexing.py:217) — o
+  `broadcast_axes` devolve índices no rank completo mas o `range_map[c][0]`
+  é pós-EXPAND/merge (o broadcast_rngs derruba o `nleft`; o bitcast merge
+  derruba o trailing) — crash no bench @16384;
+- `REDUCE has no ranges` (indexing.py:115) — o REDUCE não registrado —
+  17 testes unit MTP-mock.
+
+Fixes (fork `16daecea1`): a conversão do REDUCE sintetiza os ranges do shape
+do src quando não registrado; o `ended` guarda os índices OOB; o kv quantize
+shape-generic (`kv_q8_quantize_batched`) + o gate `_q8_kv` com fallback fp16.
+Resultados: **16K bench 151.5/25.8 tok/s** (era: crash); o sweep unit
+134→111 falhas (23 a mais passando, 0 regressão); MTP 27 ✓, ollama 42 ✓.
+Learnings: `.agents/learnings/`.
+
 ## Known limits
 
 - Prefill throughput (~150 tok/s) and decode (~15 tok/s) are the practical
