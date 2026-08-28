@@ -79,6 +79,12 @@ class TinygradModelRunner:
         self._prefill_jit = TinyJit(_prefill)
         self._decode_jit = TinyJit(_decode)
         self._warmup()
+        # GPU-resident greedy decode state (see forward_greedy): a persistent
+        # realized token buffer fed back from the in-graph argmax — no host
+        # round-trip per step (an H2D copy costs ~10-13 ms of fixed queue
+        # latency on this kfd path).
+        self._tok_buf = self._Tensor(np.zeros((1, 1), dtype=np.int32)).realize()
+        self._greedy_last_id: int | None = None
 
     def _warmup(self) -> None:
         """Compile both JIT graphs and realize the weights once at init.
@@ -139,6 +145,36 @@ class TinygradModelRunner:
             lg = self._prefill_jit(self._buf, sp, nt)
         logits = lg.realize().numpy().astype(np.float32)
         return torch.from_numpy(logits)
+
+    def forward_greedy(self, batch: Batch) -> int:
+        """Greedy decode step with zero per-step host transfers.
+
+        The input token stays on the device: forward_greedy reads the device
+        token buffer, runs the decode graph, takes argmax ON THE GPU, feeds the
+        sampled token back into the device buffer (device->device copy), and
+        returns the id to the host (4-byte D2H). Only the FIRST greedy step
+        after a prefill/new request reads batch.input_ids (one H2D, since the
+        device buffer is stale then).
+
+        Enforces consistency with the scheduler: batch.input_ids must carry the
+        id this runner returned last time; on divergence (new request) the
+        buffer is re-injected from host.
+        """
+        assert len(batch.reqs) == 1, "tinygrad runner: max_running_req=1 only"
+        req = batch.reqs[0]
+        cached_len = req.cached_len
+        ids_host = batch.input_ids.cpu().numpy().astype(np.int32)
+        if self._greedy_last_id is None or int(ids_host[0]) != self._greedy_last_id:
+            # first greedy step after a prefill / request switch: re-inject
+            self._tok_buf.assign(self._Tensor(ids_host.reshape(1, 1)))
+        sp = self._v_sp.bind(cached_len)
+        lg = self._decode_jit(self._tok_buf, sp)
+        nxt = lg.argmax(-1, keepdim=True).realize()  # (1,1,1) int32, on device
+        tok_id = int(nxt.numpy().flatten()[0])  # 4-byte D2H
+        # feed the sampled token back for the next step (device->device)
+        self._tok_buf.assign(nxt.cast("int32"))
+        self._greedy_last_id = tok_id
+        return tok_id
 
     def close(self) -> None:
         self.model = None

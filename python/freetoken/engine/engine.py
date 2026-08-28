@@ -1030,6 +1030,14 @@ class Engine:
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         if getattr(self.config, "device", "cuda") == "tinygrad":
+            if (batch.phase == "decode" and args.temperatures is None and not args.apply_penalties
+                    and hasattr(self.tinygrad_runner, "forward_greedy")):
+                # GPU-resident greedy: no logits D2H, no per-step H2D (the runner feeds
+                # the sampled token back on the device and only the 4-byte id comes up)
+                tok = self.tinygrad_runner.forward_greedy(batch)
+                next_tokens = torch.tensor([tok], dtype=torch.int32)
+                batch.reqs[0].complete_one()
+                return ForwardOutput(next_tokens, next_tokens, _NullEvent())
             with self.ctx.forward_batch(batch):
                 logits = self.tinygrad_runner.forward(batch)
             for req in batch.reqs:
