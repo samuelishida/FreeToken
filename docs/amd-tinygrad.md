@@ -60,15 +60,56 @@ FT_MODEL=/path/to/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf ./scripts/serve-tinygrad.sh
 Warm JIT (the one-time compile is excluded). Prefill is chunked (256-token
 chunks, the scheduler's cap); decode is single-token steps.
 
-| context | prefill tok/s | decode tok/s |
-|---------|--------------|--------------|
-| 4K      | 152.6        | 17.2         |
-| 16K     | 150.1        | 16.2         |
-| 64K     | 142.1        | 12.3         |
+| context  | prefill tok/s | decode tok/s |
+|----------|--------------|--------------|
+| 4K       | 152.0        | 16.5         |
+| 16K      | 149.1        | 15.9         |
+| 64K      | 141.1        | 12.3         |
+| 128K     | 133.2        | 9.5          |
 
 Prefill is MoE-bound but the flash kernels keep it ~150 tok/s; decode is
-~12-17 tok/s (MoE expert routing dominates). The first request after startup
+~9-17 tok/s (MoE expert routing dominates). The first request after startup
 pays no recompile (the runner warms both JIT graphs at init).
+
+## Baseline (Inc 1, kernel-opt plan)
+
+Measured with `scripts/bench-tinygrad.py --kernels` and
+`scripts/vram-tinygrad.py` (2026-08-28, driver 25.75 GB card).
+
+### VRAM at 128K context
+
+| item      | size     |
+|-----------|----------|
+| weights   | 22.13 GB |
+| kv        | 2.68 GB  |
+| gdn_state | 0.06 GB  |
+| remainder | 0.51 GB  (activations + JIT graphs) |
+| **free**  | **0.36 GB — HEADROOM GATE FAILS (< 1 GB)** |
+
+The gate failure is the motivation for Inc 3 (KV Q8): quantizing the KV
+cache to 8-bit restores ~1.3 GB, bringing headroom to ~1.6 GB.
+
+### Decode graph
+
+- **54 kernels** per decode step (captured JIT graph).
+- Decode is latency/bandwidth-bound: 22 GB of weights per token at ~960 GB/s
+  gives a ~43 tok/s floor; measured 9.5-16.5 tok/s → kernel-level overhead.
+
+### Startup/warmup anatomy (DEBUG=2 trace)
+
+- Model load: 20.61 GB H2D copy in ~65 s (~318 MB/s) — one-time.
+- Eager warmup pass: ~92 s GPU, dominated by slow **"batched" MoE/GDN GEMM
+  kernels** (e.g. `batched 512` at ~700 ms / ~2 TFLOPS / 17 GB/s each, ~280
+  launches). These run only in the eager phase (JIT calls 1-2); the captured
+  replay path is fast, so steady-state tok/s is unaffected.
+- JIT capture compiles a second kernel set (symbolic start_pos/n_toks
+  variants — different cache keys from the bound eager ones). First-ever run
+  at a new max_context pays ~45 comgr compiles at ~30-60 s each (~25-45 min);
+  they are cached in `~/.cache/tinygrad/cache.db` (table
+  `compile_hip_gfx1100_22`) afterwards. Warm restart: ~5-6 min total.
+- Practical consequence: the first 128K start on a machine is slow; keep the
+  tinygrad cache warm (do not run with a different max_context casually —
+  each new max_context recompiles the whole graph).
 
 ## Known limits
 
