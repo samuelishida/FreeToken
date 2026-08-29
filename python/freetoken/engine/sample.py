@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 import torch
 from freetoken.utils import is_sm90_supported, nvtx_annotate
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.core import Batch, Req
@@ -120,6 +123,21 @@ class Sampler:
         """Tinygrad path: logits are host-side torch CPU tensors; plain-torch sampler."""
         if args.apply_penalties:
             apply_penalties(logits, batch.reqs)
+        # A malformed forward here previously killed the scheduler process with
+        # ``torch.multinomial: probability tensor contains either inf, nan ...``
+        # (backend exit with no restart). Clamp instead so one bad forward costs
+        # a flagged token, not the server. NOTE: the greedy path in
+        # engine.forward_batch calls runner.forward_greedy (GPU argmax) and never
+        # reaches this guard — content regressions there are caught by the
+        # decode-nan probe / serve smoke, not here.
+        if not torch.isfinite(logits).all():
+            batch_uid = batch.reqs[0].uid if batch.reqs else -1
+            logger.error(
+                "sampler: non-finite logits (uid=%s, nan=%d, inf=%d); clamping to "
+                "-1e9 (root cause is upstream in the model forward, not sampling)",
+                batch_uid, int(torch.isnan(logits).sum()), int(torch.isinf(logits).sum()),
+            )
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=-1e9, neginf=-1e9)
         if args.temperatures is None:  # greedy
             return torch.argmax(logits, dim=-1)
         temps = args.temperatures.to(torch.float32)
