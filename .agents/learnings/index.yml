@@ -7,3 +7,9 @@ freetoken-device-seam:
 amd-stack-concepts:
   file: amd-stack-concepts.md
   description: Guia de estudo — kfd, ioctls, HIP, GLSL, compilação runtime do tinygrad, RDNA3-only, detecção de hardware/fallback, OpenCL vs kfd, portabilidade Windows.
+tinygrad-rangeify:
+  file: tinygrad-rangeify.md
+  description: O rangeify (o gerador do grafo de kernel do fork) tolera extensões simbólicas — a mecânica do broadcast OOB (pós-EXPAND ranges × full-rank indexing) e o REDUCE com os ranges sintetizados. Read antes de tocar schedule/indexing.py ou os kernels com extents simbólicos.
+tinygrad-moe-capture-nan:
+  file: tinygrad-moe-capture-nan.md
+  description: O fused expert-decode GEMM corrompe grafos TinyJit >=16K (NaN logits, crash do server); MoE genérico é o comprovado. Bench greedy não pega NaN - validar conteúdo com scripts/probe-decode-nan.py.

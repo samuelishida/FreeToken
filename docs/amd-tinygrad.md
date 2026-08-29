@@ -190,6 +190,23 @@ Resultados: **16K bench 151.5/25.8 tok/s** (era: crash); o sweep unit
 134→111 falhas (23 a mais passando, 0 regressão); MTP 27 ✓, ollama 42 ✓.
 Learnings: `.agents/learnings/`.
 
+## Decode-NaN at long context (MoE fused path) - 2026-08-29
+
+CRASH: prompt ~60K, first generated token, `multinomial: inf/nan` killed the
+scheduler. Root cause: the frozen expert-decode GEMM produces corrupt values
+in TinyJit-executed decode graphs (first anomaly block-34 MoE FFN, ~3.8e8 ->
+fp16 inf -> NaN; the greedy argmax used by all benches swallowed it silently).
+
+Fixes: MoE decode via the generic `weight[sel]` path (fork MOE_FUSED_DECODE=False,
+d3be97fa7) - captured-exec 100% finite at 16K/61K; sample_cpu clamps non-finite
+logits with an ERROR log (ffea962) instead of killing the backend.
+
+Measured: 4K decode 17.9 tok/s (30 with the fused path) - the tradeoff of
+correctness; prefill unchanged (153.4). 8192-key flash-decode cap unchanged
+(full-attention removal deferred - static-coverage prototype hit an MMU fault
+at 61K, needs more design). The captured-graph planner bug remains open:
+scripts/probe-decode-nan.py + .agents/learnings/tinygrad-rangeify.md.
+
 ## Known limits
 
 - Prefill throughput (~150 tok/s) and decode (~15 tok/s) are the practical
