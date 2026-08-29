@@ -31,6 +31,17 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-$REPO/.venv-rocm/bin/python}"
 
+# Repo-local defaults (paths, ports, context): load .env from the repo root if
+# present. Only UNSET variables are filled — an env var already exported in the
+# shell wins over .env. (FT_MODEL, FT_PORT, ... can also be set inline.)
+if [ -f "$REPO/.env" ]; then
+    while IFS='=' read -r k v; do
+        case "$k" in ''|\#*) continue ;; esac
+        case "$k" in *[!a-zA-Z0-9_]*) continue ;; esac
+        if [ -z "${!k+x}" ]; then export "$k=${v%$'\r'}"; fi
+    done < "$REPO/.env"
+fi
+
 MODEL="${FT_MODEL:-}"
 HOST="${FT_HOST:-127.0.0.1}"
 PORT="${FT_PORT:-1920}"
@@ -72,7 +83,7 @@ KV_TOKENS="${FT_KV_TOKENS:-131072}"
 # other clients inherit this.
 MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
 MOE_CACHE="${FT_MOE_CACHE:-auto}"
-LOG="${FT_LOG:-/tmp/serve_qwen_moe.log}"
+LOG="${FT_MOE_LOG:-${FT_LOG:-/tmp/serve_qwen_moe.log}}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 

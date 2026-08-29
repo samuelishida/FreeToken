@@ -12,8 +12,8 @@
 #     multiple of 128 (the runner rounds up). VRAM: 22 GB weights + fp16 KV
 #     (~2.7 GB at 128K for this model's 10 full-attn layers) + recurrent state;
 #     default 32K is conservative, raise with FT_KV_TOKENS if VRAM allows.
-#   - Startup takes ~2.5 min (model load + JIT warmup); the first request then
-#     pays no recompile.
+#   - Startup takes ~2 min (model load + JIT warmup; GGUF read is NVMe-fast,
+#     no recompile; first request pays no compile)
 #
 # Usage:
 #   ./serve-tinygrad.sh                 # launch on 127.0.0.1:1920, 128K context
@@ -30,8 +30,19 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PY:-$REPO/.venv-rocm/bin/python}"
 
-# Default: the Qwen3.6-35B-A3B GGUF on this machine. Override with FT_MODEL.
-MODEL="${FT_MODEL:-/media/smk/5fce248d-bbdd-488d-8883-4f000f85cc10/Models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
+# Repo-local defaults (paths, ports, context): load .env from the repo root if
+# present. Only UNSET variables are filled — an env var already exported in the
+# shell wins over .env. (FT_MODEL, FT_PORT, ... can also be set inline.)
+if [ -f "$REPO/.env" ]; then
+    while IFS='=' read -r k v; do
+        case "$k" in ''|\#*) continue ;; esac
+        case "$k" in *[!a-zA-Z0-9_]*) continue ;; esac
+        if [ -z "${!k+x}" ]; then export "$k=${v%$'\r'}"; fi
+    done < "$REPO/.env"
+fi
+
+# Default: the Qwen3.6-35B-A3B GGUF on this machine (NVMe). Override with FT_MODEL.
+MODEL="${FT_MODEL:-/home/smk/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf}"
 HOST="${FT_HOST:-127.0.0.1}"
 PORT="${FT_PORT:-1920}"
 # max_context in tokens (rounded up to a multiple of 128 by the runner).
@@ -42,8 +53,8 @@ KV_TOKENS="${FT_KV_TOKENS:-131072}"
 MAX_OUTPUT="${FT_MAX_OUTPUT:-65536}"
 # Stable model id served to clients (Copilot's "model" field).
 SERVED_MODEL="${FT_SERVED_MODEL:-qwen3.6}"
-LOG="${FT_LOG:-/tmp/serve_tinygrad.log}"
-PIDFILE="${FT_PIDFILE:-/tmp/serve_tinygrad.pid}"
+LOG="${FT_TG_LOG:-${FT_LOG:-/tmp/serve_tinygrad.log}}"
+PIDFILE="${FT_TG_PIDFILE:-${FT_PIDFILE:-/tmp/serve_tinygrad.pid}}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
