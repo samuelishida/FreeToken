@@ -66,6 +66,18 @@ class PromptAdmittedMsg(BaseTokenizerMsg):
 
 
 @dataclass
+class StatusMsg(BaseTokenizerMsg):
+    """Bounded scheduler telemetry forwarded to the frontend."""
+
+    uid: int
+    stage: str
+    seq: int
+    timestamp: float
+    ple: Dict[str, int] | None = None
+    error: str | None = None
+
+
+@dataclass
 class TokenizeMsg(BaseTokenizerMsg):
     uid: int
     text: str | List[Dict[str, Any]]

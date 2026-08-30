@@ -526,7 +526,12 @@ static void dequantize_row_iq1_m_cuda(const void* vx, dst_t* y, const int k, cud
 
 template <typename dst_t>
 static void dequantize_row_iq4_nl_cuda(const void* vx, dst_t* y, const int k, cudaStream_t stream) {
-  const int nb = (k + QK_K - 1) / QK_K;
+  // The public ggml_dequantize wrapper validates this contract before launch;
+  // retain a cheap defense-in-depth check for future native call sites.
+  TORCH_CHECK(k > 0 && k % QK_K == 0,
+              "generic GGUF IQ4_NL kernel requires width divisible by 256; got ", k,
+              ". Use the dedicated five-block PLE helper for 160-wide rows.");
+  const int nb = k / QK_K;
   dequantize_block_iq4_nl<<<nb, 32, 0, stream>>>(vx, y);
 }
 

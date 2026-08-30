@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import os
+import time
 from freetoken.core import get_global_ctx
 from freetoken.kernel.causal_conv1d import causal_conv1d_decode, causal_conv1d_varlen
 from freetoken.layers import BaseOP, LinearColParallelMerged
@@ -10,6 +12,9 @@ from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 from freetoken.models.qwen3_5_moe.gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 from freetoken.models.quant_linear import make_replicated_quant
+from freetoken.utils import init_logger
+
+logger = init_logger(__name__)
 
 
 _GATE_ACTIVATIONS = ("silu", "swish", "sigmoid")
@@ -85,14 +90,22 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         # fusion into an fp8 qkvz GEMM + a bf16 ba GEMM (matches sglang/vLLM).
         self._block_fp8 = expert_quant == "fp8_block"
         self._pertensor_fp8 = attn_quant == "fp8_pertensor"
+        self._gguf = attn_quant == "gguf"
         self._fp8 = self._block_fp8 or self._pertensor_fp8
 
         self._in_proj_split = [self.conv_dim, self.value_dim, num_v_heads, num_v_heads]
-        if self._fp8:
+        if self._fp8 or self._gguf:
             ColMerged = Fp8BlockColMerged if self._block_fp8 else Fp8PerTensorColMerged
-            self.in_proj_qkvz = ColMerged(
-                hidden_size, [self.conv_dim, self.value_dim], has_bias=False
-            )
+            if self._gguf:
+                from freetoken.layers.gguf import GGUFLinear
+
+                self.in_proj_qkvz = GGUFLinear(
+                    hidden_size, self.conv_dim + self.value_dim, 13
+                )
+            else:
+                self.in_proj_qkvz = ColMerged(
+                    hidden_size, [self.conv_dim, self.value_dim], has_bias=False
+                )
             self.in_proj_ba = LinearColParallelMerged(
                 hidden_size, [num_v_heads, num_v_heads], has_bias=False
             )
@@ -159,6 +172,11 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         pool = ctx.linear_state_pool
         total = hidden_states.shape[0]
         dtype = hidden_states.dtype
+        profile = (
+            os.environ.get("FREETOKEN_QWEN38_COMPONENT_TIMING", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ) and self.layer_id == 4 and hidden_states.is_cuda
+        t0 = time.perf_counter() if profile else 0.0
 
         # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
         # built once and shared by all GDN layers. The scheduler/graph set it; build it
@@ -170,10 +188,16 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             fla = build_fla_metadata(batch, hidden_states.device)
             batch.fla_metadata = fla
 
-        if self._fp8:
+        if self._fp8 or self._gguf:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
+            if profile:
+                torch.cuda.synchronize(hidden_states.device)
+                logger.info("Qwen3.8 component layer=4 in_proj_qkvz_ms=%.2f", (time.perf_counter()-t0)*1000)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
             ba = self.in_proj_ba.forward(hidden_states)
+            if profile:
+                torch.cuda.synchronize(hidden_states.device)
+                logger.info("Qwen3.8 component layer=4 in_proj_ba_ms=%.2f", (time.perf_counter()-t0)*1000)
             b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:
             proj = self.in_proj.forward(hidden_states)
@@ -186,6 +210,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
             # no clone, no external l2norm). q/k stay at num_k_heads (kernel handles GQA).
             mixed = self._conv_decode(conv_in, fla.cache_indices, pool)  # [B, conv_dim]
+            if profile:
+                torch.cuda.synchronize(hidden_states.device)
+                logger.info("Qwen3.8 component layer=4 conv_ms=%.2f", (time.perf_counter()-t0)*1000)
             B = mixed.shape[0]
             qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
@@ -196,6 +223,9 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
                 state_source=pool.recurrent_states[li], indices=fla.cache_indices,
                 cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
             )
+            if profile:
+                torch.cuda.synchronize(hidden_states.device)
+                logger.info("Qwen3.8 component layer=4 gdn_ms=%.2f", (time.perf_counter()-t0)*1000)
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
@@ -227,7 +257,14 @@ class Qwen4ExpGatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
-        return self.out_proj.forward(out)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            logger.info("Qwen3.8 component layer=4 norm_ms=%.2f", (time.perf_counter()-t0)*1000)
+        result = self.out_proj.forward(out)
+        if profile:
+            torch.cuda.synchronize(hidden_states.device)
+            logger.info("Qwen3.8 component layer=4 out_proj_ms=%.2f total_ms=%.2f", (time.perf_counter()-t0)*1000, (time.perf_counter()-t0)*1000)
+        return result
 
 
 __all__ = ["Qwen4ExpGatedDeltaNet"]

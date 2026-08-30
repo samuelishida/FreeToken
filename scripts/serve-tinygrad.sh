@@ -105,7 +105,7 @@ case "${1:-}" in
         echo "POST /v1/chat/completions ->"
         curl -s "http://$HOST:$PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d '{"model":"qwen3.6","messages":[{"role":"user","content":"What is the capital of France? Answer in one word."}],"max_tokens":256,"stream":false}' \
+            -d "{\"model\":\"$SERVED_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France? Answer in one word.\"}],\"max_tokens\":256,\"stream\":false}" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print('  content:', repr(d['choices'][0]['message'].get('content',''))); print('  finish:', d['choices'][0]['finish_reason'])"
         exit 0
         ;;

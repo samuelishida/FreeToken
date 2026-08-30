@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -22,11 +23,15 @@ from .api_models import (
 )
 from .function_call_parser import ToolCallItem
 from .request_logger import log_request
+from .accounting import AdmissionBusyError
 from .generation import (
     ContentDelta,
     GenDone,
+    GenerationTimeout,
     GenerationError,
+    KEEPALIVE,
     GenSpec,
+    RequestDeadline,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
@@ -37,11 +42,99 @@ from .generation import (
     render_messages,
     resolve_sampling,
     submit_generation,
+    with_keepalive,
 )
 
 #: The wire superset plus "off", DeepSeek's disable synonym that
 #: effort_toggle_kwargs has always honored.
 _ACCEPTED_EFFORTS = (*KNOWN_REASONING_EFFORTS, "off")
+
+# Prefill can be long for Qwen4 GGUF: PLE/expert pages may be fetched from host
+# storage before first token. Keep OpenAI-compatible SSE clients (including VSCode)
+# from treating a valid 200 stream as dead while generation is progressing.
+_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+
+
+def _deadline(state: Any, deadline: RequestDeadline | None) -> RequestDeadline:
+    return deadline if deadline is not None else RequestDeadline.start(state)
+
+
+async def _abort_once(
+    state: Any, uid: int | None, timeout: GenerationTimeout | None = None
+) -> None:
+    if uid is None:
+        return
+    if timeout is not None and timeout.aborted:
+        return
+    abort = getattr(state, "abort_user", None)
+    if abort is not None:
+        await abort(uid)
+        if timeout is not None:
+            timeout.aborted = True
+
+
+def _request_timeout_error(exc: GenerationTimeout) -> JSONResponse:
+    return create_error_response(
+        str(exc), status_code=504, err_type="timeout", code=exc.code
+    )
+
+
+def _stream_error_chunk(
+    req: ChatCompletionRequest | CompletionRequest, uid: int, exc: Exception
+) -> bytes:
+    """Return timeout/error as a data-bearing OpenAI chunk.
+
+    HTTP headers are already 200 once a stream starts.  An ``error``-only SSE frame is valid
+    for some clients, but VS Code's Copilot parser requires every data frame to contain
+    ``choices`` and otherwise reports ``Response contained no choices``.  Preserve machine
+    readable error metadata while making terminal state parseable by both clients.
+    """
+    error_type = "timeout" if isinstance(exc, GenerationTimeout) else "invalid_request_error"
+    if isinstance(req, ChatCompletionRequest):
+        return _sse({
+            **_chat_chunk(
+                req,
+                uid,
+                [{
+                    "delta": {"content": f"[FreeToken] {exc}"},
+                    "index": 0,
+                    "finish_reason": "length",
+                }],
+            ),
+            "error": {
+                "message": str(exc),
+                "type": error_type,
+                "code": getattr(exc, "code", None),
+            },
+        })
+    return _sse({
+        "id": f"cmpl-{uid}",
+        "object": "text_completion.chunk",
+        "created": int(time.time()),
+        "model": req.model,
+        "choices": [{
+            "text": f"[FreeToken] {exc}",
+            "index": 0,
+            "finish_reason": "length",
+            "logprobs": None,
+        }],
+        "error": {
+            "message": str(exc),
+            "type": error_type,
+            "code": getattr(exc, "code", None),
+        },
+    })
+
+
+def _heartbeat_interval(state: Any) -> float:
+    value = getattr(getattr(state, "config", None), "sse_heartbeat_s", _STREAM_KEEPALIVE_INTERVAL_S)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("sse_heartbeat_s must be a positive finite number") from None
+    if value <= 0 or not math.isfinite(value):
+        raise ValueError("sse_heartbeat_s must be a positive finite number")
+    return value
 
 
 def _thinking_type(req: Any) -> str | None:
@@ -116,19 +209,25 @@ def register_openai_routes(
 
     @app.post("/v1/chat/completions")
     async def v1_chat_completions(req: ChatCompletionRequest, request: Request):
-        log_request("/v1/chat/completions", req, request)
         state = get_state()
+        deadline = RequestDeadline.start(state)
+        log_request("/v1/chat/completions", req, request)
         if (gate := _maintenance_gate(state)) is not None:
             return gate
-        return await handle_chat_completion(req, request, state, get_model_sampling())
+        return await handle_chat_completion(
+            req, request, state, get_model_sampling(), deadline=deadline
+        )
 
     @app.post("/v1/completions")
     async def v1_completions(req: CompletionRequest, request: Request):
-        log_request("/v1/completions", req, request)
         state = get_state()
+        deadline = RequestDeadline.start(state)
+        log_request("/v1/completions", req, request)
         if (gate := _maintenance_gate(state)) is not None:
             return gate
-        return await handle_completion(req, request, state, get_model_sampling())
+        return await handle_completion(
+            req, request, state, get_model_sampling(), deadline=deadline
+        )
 
     @app.get("/v1/models")
     async def v1_models():
@@ -151,7 +250,10 @@ async def handle_chat_completion(
     request: Request | None,
     state: Any,
     model_sampling: dict[str, Any],
+    *,
+    deadline: RequestDeadline | None = None,
 ):
+    deadline = _deadline(state, deadline)
     if req.function_call is not None:
         return create_error_response("function_call is not supported; use tools/tool_choice instead")
     if req.logit_bias is not None:
@@ -188,20 +290,39 @@ async def handle_chat_completion(
     if req.stream:
         # Non-stream requests already surface render failures as a clean 400
         # through GenerationError; only the stream path needs the pre-check.
-        err = await prerender_error(spec, state)
+        try:
+            err = await deadline.wait(prerender_error(spec, state), "render")
+        except GenerationTimeout as exc:
+            return _request_timeout_error(exc)
         if err is not None:
             return create_error_response(str(err), code=err.code)
 
-    uid = await submit_generation(spec, state)
+    try:
+        uid = await submit_generation(spec, state, deadline=deadline)
+    except AdmissionBusyError as exc:
+        return create_error_response(
+            str(exc), status_code=429, err_type="rate_limit_error", code="server_busy",
+            headers={"Retry-After": "1"},
+        )
+    except GenerationTimeout as exc:
+        await _abort_once(state, exc.uid, exc)
+        return _request_timeout_error(exc)
+    except Exception as exc:  # noqa: BLE001 — submit_generation already aborts allocated uid
+        return create_error_response(f"admission failed: {exc}", status_code=500)
 
     if req.stream:
-        chunks = stream_chat_completion_chunks(uid, req, state, spec)
+        chunks = stream_chat_completion_chunks(uid, req, state, spec, deadline=deadline)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
         return StreamingResponse(chunks, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
+        result = await deadline.wait(
+            generate_full(uid, spec, state, source="/v1/chat/completions"), "generation"
+        )
+    except GenerationTimeout as exc:
+        await _abort_once(state, uid, exc)
+        return _request_timeout_error(exc)
     except GenerationError as exc:
         return create_error_response(str(exc), code=exc.code)
     message: dict[str, Any] = {"role": "assistant", "content": result.content}
@@ -235,10 +356,14 @@ async def stream_chat_completion_chunks(
     req: ChatCompletionRequest,
     state: Any,
     spec: GenSpec | None = None,
+    *,
+    deadline: RequestDeadline | None = None,
 ) -> AsyncIterator[bytes]:
     """Format generate_events() into the OpenAI chat.completion.chunk SSE stream."""
     if spec is None:
         spec = chat_request_to_genspec(req, {})
+    deadline = _deadline(state, deadline)
+    deadline.uid = uid
     yield _sse(
         _chat_chunk(
             req,
@@ -252,19 +377,32 @@ async def stream_chat_completion_chunks(
     cached_tokens = 0
     tool_calls_sent = 0
     open_tool: dict[str, Any] | None = None
-    events = generate_events(uid, spec, state, source="/v1/chat/completions")
+    events = with_keepalive(
+        generate_events(uid, spec, state, source="/v1/chat/completions"),
+        _heartbeat_interval(state),
+    )
     while True:
         try:
-            ev = await events.__anext__()
+            ev = await deadline.wait(events.__anext__(), "generation")
         except StopAsyncIteration:
             break
+        except GenerationTimeout as exc:
+            await _abort_once(state, uid, exc)
+            yield _stream_error_chunk(req, uid, exc)
+            yield b"data: [DONE]\n\n"
+            return
         except GenerationError as exc:
             # Request failed before producing output — emit an error chunk + [DONE] so the
             # client gets a terminal signal instead of a stalled stream.
-            yield _sse(
-                {"error": {"message": str(exc), "type": "invalid_request_error", "code": exc.code}}
-            )
+            yield _stream_error_chunk(req, uid, exc)
+            yield b"data: [DONE]\n\n"
             break
+        if ev is KEEPALIVE:
+            # Data-bearing empty delta keeps OpenAI/Copilot clients aware that request is alive;
+            # retain comment for proxies that only count bytes and ignore data semantics.
+            yield _sse(_chat_chunk(req, uid, [{"delta": {}, "index": 0, "finish_reason": None}]))
+            yield b": keep-alive\n\n"
+            continue
         if isinstance(ev, ReasoningDelta):
             yield _sse(
                 _chat_chunk(
@@ -383,7 +521,10 @@ async def handle_completion(
     request: Request | None,
     state: Any,
     model_sampling: dict[str, Any],
+    *,
+    deadline: RequestDeadline | None = None,
 ):
+    deadline = _deadline(state, deadline)
     unsupported = _completion_unsupported_reason(req)
     if unsupported is not None:
         return create_error_response(unsupported)
@@ -397,11 +538,35 @@ async def handle_completion(
     if req.stream:
         if len(prompts) != 1:
             return create_error_response("Streaming completions only support a single text prompt")
-        uid = state.new_user()
-        await state.send_one(
-            TokenizeMsg(uid=uid, text=prompts[0], sampling_params=_resolve_sampling(req, model_sampling))
-        )
-        chunks = stream_completion_chunks(uid, req, state)
+        try:
+            uid = state.new_user()
+        except AdmissionBusyError as exc:
+            return create_error_response(
+                str(exc), status_code=429, err_type="rate_limit_error", code="server_busy",
+                headers={"Retry-After": "1"},
+            )
+        deadline.uid = uid
+        try:
+            await deadline.wait(
+                state.send_one(
+                    TokenizeMsg(
+                        uid=uid,
+                        text=prompts[0],
+                        sampling_params=_resolve_sampling(req, model_sampling),
+                    )
+                ),
+                "admission",
+            )
+        except GenerationTimeout as exc:
+            await _abort_once(state, uid, exc)
+            return _request_timeout_error(exc)
+        except asyncio.CancelledError:
+            await asyncio.shield(_abort_once(state, uid))
+            raise
+        except Exception as exc:  # noqa: BLE001 — release allocated uid on transport failure
+            await _abort_once(state, uid)
+            return create_error_response(f"admission failed: {exc}", status_code=500)
+        chunks = stream_completion_chunks(uid, req, state, deadline=deadline)
         if request is not None:
             chunks = state.stream_with_cancellation(chunks, request, uid)
         return StreamingResponse(chunks, media_type="text/event-stream")
@@ -411,11 +576,45 @@ async def handle_completion(
     completion_tokens = 0
     cached_tokens = 0
     for index, prompt in enumerate(prompts):
-        uid = state.new_user()
-        await state.send_one(TokenizeMsg(uid=uid, text=prompt, sampling_params=_resolve_sampling(req, model_sampling)))
+        try:
+            uid = state.new_user()
+        except AdmissionBusyError as exc:
+            return create_error_response(
+                str(exc), status_code=429, err_type="rate_limit_error", code="server_busy",
+                headers={"Retry-After": "1"},
+            )
+        deadline.uid = uid
+        try:
+            await deadline.wait(
+                state.send_one(
+                    TokenizeMsg(
+                        uid=uid,
+                        text=prompt,
+                        sampling_params=_resolve_sampling(req, model_sampling),
+                    )
+                ),
+                "admission",
+            )
+        except GenerationTimeout as exc:
+            await _abort_once(state, uid, exc)
+            return _request_timeout_error(exc)
+        except asyncio.CancelledError:
+            await asyncio.shield(_abort_once(state, uid))
+            raise
+        except Exception as exc:  # noqa: BLE001 — release allocated uid on transport failure
+            await _abort_once(state, uid)
+            return create_error_response(f"admission failed: {exc}", status_code=500)
         text = ""
         finish_reason = "stop"
-        async for ack in state.wait_for_ack(uid):
+        ack_iter = state.wait_for_ack(uid).__aiter__()
+        while True:
+            try:
+                ack = await deadline.wait(ack_iter.__anext__(), "generation")
+            except StopAsyncIteration:
+                break
+            except GenerationTimeout as exc:
+                await _abort_once(state, uid, exc)
+                return _request_timeout_error(exc)
             if getattr(ack, "error", None):
                 return create_error_response(ack.error)
             prompt_tokens += ack.prompt_tokens_delta
@@ -437,14 +636,48 @@ async def handle_completion(
     }
 
 
-async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any) -> AsyncIterator[bytes]:
+async def stream_completion_chunks(
+    uid: int,
+    req: CompletionRequest,
+    state: Any,
+    *,
+    deadline: RequestDeadline | None = None,
+) -> AsyncIterator[bytes]:
+    deadline = _deadline(state, deadline)
+    deadline.uid = uid
     prompt_tokens = 0
     completion_tokens = 0
     cached_tokens = 0
     finish_reason = "stop"
-    async for ack in state.wait_for_ack(uid):
+    events = with_keepalive(_completion_ack_events(uid, state), _heartbeat_interval(state))
+    while True:
+        try:
+            ack = await deadline.wait(events.__anext__(), "generation")
+        except StopAsyncIteration:
+            break
+        except GenerationTimeout as exc:
+            await _abort_once(state, uid, exc)
+            yield _stream_error_chunk(req, uid, exc)
+            yield b"data: [DONE]\n\n"
+            return
+        if ack is KEEPALIVE:
+            yield _sse(
+                {
+                    "id": f"cmpl-{uid}",
+                    "object": "text_completion.chunk",
+                    "created": int(time.time()),
+                    "model": req.model,
+                    "choices": [{"text": "", "index": 0, "finish_reason": None, "logprobs": None}],
+                }
+            )
+            yield b": keep-alive\n\n"
+            continue
         if getattr(ack, "error", None):
-            yield _sse({"error": {"message": ack.error, "type": "invalid_request_error", "code": None}})
+            yield _stream_error_chunk(
+                req,
+                uid,
+                GenerationError(ack.error, getattr(ack, "error_code", None)),
+            )
             yield b"data: [DONE]\n\n"
             return
         prompt_tokens += ack.prompt_tokens_delta
@@ -496,12 +729,18 @@ async def stream_completion_chunks(uid: int, req: CompletionRequest, state: Any)
     yield b"data: [DONE]\n\n"
 
 
+async def _completion_ack_events(uid: int, state: Any) -> AsyncIterator[Any]:
+    async for ack in state.wait_for_ack(uid):
+        yield ack
+
+
 def create_error_response(
     message: str,
     status_code: int = 400,
     err_type: str = "invalid_request_error",
     param: str | None = None,
     code: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
@@ -513,6 +752,7 @@ def create_error_response(
                 "code": code,
             }
         },
+        headers=headers,
     )
 
 
@@ -650,7 +890,10 @@ def _is_token_prompt(prompt: Any) -> bool:
         and bool(prompt)
         and (
             all(isinstance(item, int) for item in prompt)
-            or all(isinstance(item, list) and all(isinstance(token, int) for token in item) for item in prompt)
+            or all(
+                isinstance(item, list) and all(isinstance(token, int) for token in item)
+                for item in prompt
+            )
         )
     )
 

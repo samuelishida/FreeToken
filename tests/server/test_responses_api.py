@@ -13,6 +13,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from types import SimpleNamespace
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -24,7 +25,9 @@ from freetoken.message.frontend import UserReply  # noqa: E402
 from freetoken.server import responses_api as RP  # noqa: E402
 from freetoken.server.responses_api import ResponsesRequest  # noqa: E402
 from freetoken.server.function_call_parser import ToolCallItem  # noqa: E402
-from freetoken.server.generation import ContentDelta, GenDone, GenResult, ToolCallsDelta  # noqa: E402
+from freetoken.server.generation import (  # noqa: E402
+    ContentDelta, GenDone, GenResult, RequestDeadline, ToolCallsDelta,
+)
 
 
 async def _aiter(items):
@@ -47,6 +50,34 @@ def _collect(events, req):
         return out
 
     return asyncio.run(run())
+
+
+def test_responses_deadline_stream_emits_terminal_failure():
+    async def never():
+        await asyncio.Event().wait()
+        yield None  # pragma: no cover
+
+    class State:
+        aborted = []
+
+        async def abort_user(self, uid):
+            self.aborted.append(uid)
+
+    async def run():
+        state = State()
+        deadline = RequestDeadline(timeout_s=1.0, started_at=time.monotonic() - 2.0, uid=7)
+        req = ResponsesRequest.model_validate({"model": "gpt-x", "input": "hi", "stream": True})
+        frames = []
+        async for frame in RP.responses_stream_generator(
+            RP._deadline_events(never(), state, 7, deadline), req, "resp_1", 0
+        ):
+            frames.append(frame)
+        return frames, state.aborted
+
+    frames, aborted = asyncio.run(run())
+    assert aborted == [7]
+    assert any('"type":"response.failed"' in frame for frame in frames)
+    assert any('"code":"request_timeout"' in frame for frame in frames)
 
 
 # --------------------------------------------------------------------------- #

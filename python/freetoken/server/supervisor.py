@@ -11,6 +11,7 @@ watching on top of this.
 from __future__ import annotations
 
 import time
+import math
 from dataclasses import dataclass, field
 from queue import Empty
 from typing import Any, Callable, List
@@ -72,6 +73,16 @@ def _first_dead(processes: List[Any]) -> Any | None:
     return None
 
 
+def _terminate_workers(processes: List[Any]) -> None:
+    """Stop startup workers when a bounded readiness deadline expires."""
+    for process in processes or []:
+        try:
+            if process.is_alive():
+                process.terminate()
+        except Exception:  # noqa: BLE001 — process may have exited during the race
+            continue
+
+
 def _as_error(msg: Any) -> str | None:
     """The reason a dying worker pushed as ("error", reason), or None for any other ack — lets
     the supervisor report the real cause (e.g. a config ValueError) rather than the generic
@@ -102,6 +113,7 @@ def drain_ready(
     get: Callable[[float], Any] | None = None,
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
+    startup_probe_timeout_s: float | None = 300.0,
 ) -> None:
     """Block until ``expected_acks`` non-progress acks arrive, applying ("progress", …)
     tuples to ``progress``. Between acks, poll worker liveness; raise WorkerDied if a worker
@@ -115,9 +127,23 @@ def drain_ready(
             return handle.ack_queue.get(timeout=timeout)
 
     ready = 0
+    deadline = None
+    if startup_probe_timeout_s is not None:
+        if startup_probe_timeout_s <= 0 or not math.isfinite(float(startup_probe_timeout_s)):
+            raise ValueError("startup_probe_timeout_s must be a positive finite number")
+        deadline = time.monotonic() + float(startup_probe_timeout_s)
     while ready < handle.expected_acks:
+        wait_for = poll
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_workers(handle.processes)
+                raise WorkerDied(
+                    f"backend startup probe timed out after {float(startup_probe_timeout_s):.3f}s"
+                )
+            wait_for = min(wait_for, remaining)
         try:
-            msg = get(poll)
+            msg = get(wait_for)
         except Empty:
             dead = _first_dead(handle.processes)
             if dead is not None:
@@ -147,6 +173,7 @@ def run_backend_supervisor(
     poll: float = 1.0,
     on_meta: Callable[[dict], None] | None = None,
     is_shutting_down: Callable[[], bool] | None = None,
+    startup_probe_timeout_s: float | None = 300.0,
 ) -> None:
     """Drain to readiness (watching liveness), flip the gate via ``on_ready``, then watch
     forever: a worker that dies AFTER ready (a scheduler crash while the frontend keeps
@@ -165,7 +192,13 @@ def run_backend_supervisor(
         return bool(is_shutting_down is not None and is_shutting_down())
 
     try:
-        drain_ready(handle, progress, poll=poll, on_meta=on_meta)
+        drain_ready(
+            handle,
+            progress,
+            poll=poll,
+            on_meta=on_meta,
+            startup_probe_timeout_s=startup_probe_timeout_s,
+        )
     except WorkerDied as exc:
         # A worker dying mid-load during an orderly shutdown is expected, not a load failure.
         if not _shutting_down() and on_failure is not None:

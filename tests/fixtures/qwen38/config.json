@@ -1,0 +1,1 @@
+{"model_type":"qwen4_exp","text_config":{"model_type":"qwen4_exp_text","num_hidden_layers":48,"layer_types":["linear_attention","linear_attention","linear_attention","full_attention"]},"fixture":"geometry is supplied by test defaults"}

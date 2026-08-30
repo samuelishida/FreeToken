@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, List, NamedTuple, NoReturn, Set, Tuple, TypeAlias
 
 import torch
@@ -17,6 +18,7 @@ from freetoken.message import (
     ErrorReplyMsg,
     ExitMsg,
     PromptAdmittedMsg,
+    StatusMsg,
     UserMsg,
 )
 from freetoken.utils import (
@@ -41,6 +43,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 Indice2D: TypeAlias = Tuple[torch.Tensor, torch.Tensor]
+
+
+def _emit_scheduler_status(
+    scheduler, uid: int, stage: str, ple: dict | None = None, error: str | None = None
+) -> None:
+    """Invoke optional telemetry on real schedulers; tolerate lightweight test doubles."""
+    emit = getattr(scheduler, "_emit_status", None)
+    if emit is not None:
+        emit(uid, stage, ple, error)
 
 
 def _gib(n_bytes: int) -> str:
@@ -99,6 +110,10 @@ class Scheduler(SchedulerIOMixin):
         self.prefill_manager = PrefillManager(
             self.cache_manager, self.table_manager, self.decode_manager
         )
+        # Bound prefill priority: one runnable prefill batch may run before a
+        # runnable decode batch gets a turn.  Long 1024-token prompt chunks must
+        # not starve an already-generating request indefinitely.
+        self._prefill_batches_since_decode = 0
 
         # some alias for easy access
         self.finished_reqs: Set[Req] = set()
@@ -120,6 +135,7 @@ class Scheduler(SchedulerIOMixin):
         # A received-but-not-yet-executed runtime cache rebuild (CacheRebuildBackendMsg),
         # run at the next idle safe point in overlap_loop. None when no rebuild is pending.
         self._pending_rebuild: CacheRebuildBackendMsg | None = None
+        self._status_seq = 0
         self.tokenizer = load_tokenizer(config.model_path)
         self.eos_token_ids = load_eos_token_ids(config.model_path, self.tokenizer)
         self.toolcall_anchor_id = None
@@ -143,8 +159,12 @@ class Scheduler(SchedulerIOMixin):
             runner_cap = getattr(self.engine, "tinygrad_runner", None)
             if runner_cap is not None:
                 _chunk_cap = min(_chunk_cap or 1 << 30, runner_cap.max_batch)
+        configured_prefill = config.max_extend_tokens
+        resolve_chunk = getattr(self.engine, "resolve_prefill_chunk", None)
+        if resolve_chunk is not None:
+            configured_prefill = resolve_chunk(configured_prefill)
         self.prefill_budget = (
-            min(config.max_extend_tokens, _chunk_cap) if _chunk_cap else config.max_extend_tokens
+            min(configured_prefill, _chunk_cap) if _chunk_cap else configured_prefill
         )
         self.config = config
         self.status_reporter = SchedulerStatusReporter(
@@ -181,6 +201,7 @@ class Scheduler(SchedulerIOMixin):
             torch.cuda.synchronize(self.device)
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
+        self._prefill_batches_since_decode = 0
         self.engine.rebuild_runtime_cache(
             moe_cache_size=moe_cache_size, num_pages=num_pages, num_mamba_slots=num_mamba_slots,
             num_swa_pages=num_swa_pages,
@@ -202,9 +223,12 @@ class Scheduler(SchedulerIOMixin):
         # shrank the pool must shrink the cap too, or the next long prompt is chunked against
         # the stale budget and crashes _alloc_window.
         _chunk_cap = self.cache_manager.prefill_chunk_budget
+        configured_prefill = self.config.max_extend_tokens
+        resolve_chunk = getattr(self.engine, "resolve_prefill_chunk", None)
+        if resolve_chunk is not None:
+            configured_prefill = resolve_chunk(configured_prefill)
         self.prefill_budget = (
-            min(self.config.max_extend_tokens, _chunk_cap)
-            if _chunk_cap else self.config.max_extend_tokens
+            min(configured_prefill, _chunk_cap) if _chunk_cap else configured_prefill
         )
         if self.config.tp_info.size > 1:
             self.sync_all_ranks()
@@ -421,6 +445,9 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
+                if m.finished:
+                    _emit_scheduler_status(self, m.uid, "finished")
+        moe_stats_snapshot = getattr(self, "_moe_stats_snapshot", lambda: None)()
         self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
@@ -430,7 +457,7 @@ class Scheduler(SchedulerIOMixin):
             page_size=self.config.page_size,
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
-            moe_stats=self._moe_stats_snapshot(),
+            moe_stats=moe_stats_snapshot,
         )
         self.send_result(reply)
 
@@ -543,15 +570,29 @@ class Scheduler(SchedulerIOMixin):
                         )
                     ]
                 )
+                _emit_scheduler_status(
+                    self, msg.uid, "error", error=f"prompt too long: {input_len} > {max_seq_len}"
+                )
                 return
             if msg.sampling_params.max_tokens > max_output_len:
                 msg.sampling_params.max_tokens = max_output_len
                 logger.warning_rank0(
                     f"Adjust max_tokens to {max_output_len} for request {msg.uid}."
                 )
-            self.prefill_manager.add_one_req(msg)
+            _emit_scheduler_status(self, msg.uid, "submitted")
+            try:
+                self.prefill_manager.add_one_req(msg)
+            except Exception as exc:  # noqa: BLE001 — isolate request admission failures
+                logger.error(f"Request {msg.uid} admission failed: {exc}")
+                _emit_scheduler_status(self, msg.uid, "error", error=str(exc))
+                self.send_result([
+                    ErrorReplyMsg(uid=msg.uid, error=f"request admission failed: {exc}")
+                ])
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
+            # A cancellation ends current prefill pressure; restart fairness
+            # accounting so next runnable decode is not penalized by stale turns.
+            self._prefill_batches_since_decode = 0
             tombstones = getattr(self, "_abort_tombstones", None)
             if tombstones is None:
                 tombstones = self._abort_tombstones = {}
@@ -585,6 +626,7 @@ class Scheduler(SchedulerIOMixin):
             # _flush_abort_acks runs after _process_last_data, making this a true terminal
             # accounting barrier for FrontendManager/prepare-stop.
             self._pending_abort_acks.add(msg.uid)
+            _emit_scheduler_status(self, msg.uid, "aborted")
         elif isinstance(msg, CacheRebuildBackendMsg):
             # v1 scope: only if_idle, single-rank, non-owned-KV. drain mode and TP rebuild
             # need the drain-gate / all-rank failure-agreement machinery (deferred), so we
@@ -749,7 +791,9 @@ class Scheduler(SchedulerIOMixin):
         return dict(
             num_pages=eng.num_pages,
             moe_cache_size=eng.moe_offload_cache.cache_size if eng.moe_offload_cache is not None else None,
-            num_mamba_slots=(eng.linear_state_pool.num_slots - 1) if eng.linear_state_pool is not None else None,
+            num_mamba_slots=(eng.linear_state_pool.num_slots - 1)
+            if eng.linear_state_pool is not None
+            else None,
             num_swa_pages=num_swa_pages,
         )
 
@@ -840,6 +884,16 @@ class Scheduler(SchedulerIOMixin):
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
         self.engine.attn_backend.prepare_metadata(batch)
+        # Bind n-gram row metadata to this exact request/cache generation.  The
+        # identity is immutable for duration of forward and changes whenever a
+        # request advances or a different prefix/COW handle is allocated.
+        batch.ple_cache_handle = tuple(
+            (req.uid, id(req.cache_handle), req.table_idx) for req in batch.reqs
+        )
+        batch.ple_context_version = hash(tuple(
+            (req.uid, req.ple_context_version, req.cached_len, req.device_len)
+            for req in batch.reqs
+        ))
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),
@@ -858,11 +912,31 @@ class Scheduler(SchedulerIOMixin):
             batch.mm_embeds = torch.cat(parts, dim=0)
 
     def _schedule_next_batch(self) -> ForwardInput | None:
-        # TODO: support other policies: e.g. DECODE first
-        batch = (
-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
-            or self.decode_manager.schedule_next_batch()
-        )
+        # Lightweight scheduler test doubles may expose only schedule methods;
+        # treat absent readiness properties as potentially runnable and let the
+        # method result decide.
+        prefill_ready = getattr(self.prefill_manager, "runnable", True)
+        decode_ready = getattr(self.decode_manager, "runnable", False)
+        batch = None
+        # Fairness rule: when both queues are runnable, allow at most one
+        # prefill batch between decode batches.  Preserve prefill-first startup
+        # and configured chunk size; this only selects which ready batch runs.
+        if decode_ready and (not prefill_ready or self._prefill_batches_since_decode >= 1):
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                self._prefill_batches_since_decode = 0
+        elif prefill_ready:
+            batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            if batch is not None:
+                self._prefill_batches_since_decode = (
+                    self._prefill_batches_since_decode + 1 if decode_ready else 0
+                )
+        # A prefill can be runnable but temporarily unable to allocate pages;
+        # let decode proceed instead of returning idle and spinning forever.
+        if batch is None and decode_ready:
+            batch = self.decode_manager.schedule_next_batch()
+            if batch is not None:
+                self._prefill_batches_since_decode = 0
         if batch is None:
             return None
         forward_input = self._prepare_batch(batch)
@@ -883,6 +957,8 @@ class Scheduler(SchedulerIOMixin):
                 for uid, prompt_tokens, cached_tokens in batch.prompt_admissions
             ]
         )
+        for uid, _prompt_tokens, _cached_tokens in batch.prompt_admissions:
+            _emit_scheduler_status(self, uid, "prompt_admitted")
 
     def _flush_abort_acks(self) -> None:
         pending = getattr(self, "_pending_abort_acks", None)
@@ -894,13 +970,103 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        table = getattr(getattr(self.engine, "model", None), "_ple_table", None)
+        ple_report = getattr(table, "report", None) if table is not None else None
+        def _storage_snapshot():
+            value = ple_report() if callable(ple_report) else {}
+            value = dict(value or {})
+            attn_report = getattr(getattr(self.engine, "attn_backend", None), "report", None)
+            if callable(attn_report):
+                value.update(attn_report())
+            return value or None
+
+        snapshot = _storage_snapshot()
+        for req in batch.reqs:
+            _emit_scheduler_status(self, req.uid, "forward_started", snapshot)
+            if table is not None:
+                _emit_scheduler_status(self, req.uid, "ple_lookup", snapshot)
+                _emit_scheduler_status(self, req.uid, "dequant_started", snapshot)
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
             self.cache_manager.snapshot_toolcall_anchor(batch.reqs)
-        forward_output = self.engine.forward_batch(batch, sample_args)
+        observed_stages: list[str] = []
+        if table is not None and hasattr(table, "set_status_observer"):
+            def _observe_ple_stage(stage: str) -> None:
+                if len(observed_stages) < 64:
+                    observed_stages.append(stage)
+                # Publish immediately: a worker blocked in a backend call must not
+                # wait for ``engine.forward_batch`` to return before status explains
+                # where it stopped.
+                ple = _storage_snapshot()
+                for req in batch.reqs:
+                    _emit_scheduler_status(self, req.uid, stage, ple)
+
+            table.set_status_observer(_observe_ple_stage)
+        try:
+            forward_output = self.engine.forward_batch(batch, sample_args)
+        except Exception:
+            for req in batch.reqs:
+                _emit_scheduler_status(self, req.uid, "error", error="forward failed")
+            raise
+        finally:
+            if table is not None and hasattr(table, "set_status_observer"):
+                table.set_status_observer(None)
+        for stage in dict.fromkeys(observed_stages):
+            for req in batch.reqs:
+                _emit_scheduler_status(
+                    self, req.uid, stage, _storage_snapshot()
+                )
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
+        snapshot = _storage_snapshot() or snapshot
+        # Prefill produces each request's first sampled token. Decode forwards are
+        # subsequent tokens and must not overwrite live request-stage telemetry.
+        if batch.is_prefill:
+            for req in batch.reqs:
+                _emit_scheduler_status(self, req.uid, "first_token", snapshot)
         return forward_output
+
+    def _emit_status(self, uid: int, stage: str, ple: dict | None = None, error: str | None = None) -> None:
+        """Best-effort bounded telemetry; scheduler progress never depends on its consumer."""
+        if not hasattr(self, "status_reporter"):
+            return
+        # Decoder layers can emit two callbacks each. Forward-level and PLE
+        # milestones already identify stalls; forwarding every layer callback
+        # floods tokenizer IPC during long prefill and competes with token acks.
+        if str(stage).startswith("layer_"):
+            return
+        # Some scheduler lifecycle helpers are exercised with ``Scheduler.__new__``
+        # fixtures (before ``__init__`` creates telemetry state). Keep telemetry
+        # optional: missing observer state must never turn abort/accounting into a
+        # request failure.
+        seq = int(getattr(self, "_status_seq", 0)) + 1
+        self._status_seq = seq
+        try:
+            snapshot = None
+            if ple:
+                keys = (
+                    "forward_calls", "lookup_calls", "prefetch_requests", "prefetch_hits",
+                    "prefetch_late", "ram_page_hits", "ram_page_misses", "ram_page_evictions",
+                    "gpu_hits", "gpu_misses", "gpu_evictions", "ssd_read_ops", "ssd_read_bytes",
+                    "io_wait_us", "lookup_wait_us", "dequant_calls", "dequant_errors",
+                    "prefetch_calls", "pages_read", "cache_hits", "cache_misses", "waits",
+                    "prefetch_plan_us", "prefetch_d2h_us", "io_queue_wait_us", "ram_gather_us",
+                    "h2d_submit_us", "io_failed_ops", "io_queue_starvation",
+                    "planned_rows", "planned_unique_rows", "planned_pages",
+                    "gpu_batched_rows", "gpu_batch_ops", "gpu_reconstruct_ops",
+                    "fused_dequant_calls", "fused_dequant_fallbacks",
+                    "qsa_forward_calls", "qsa_prefill_calls", "qsa_live_columns",
+                    "qsa_allocated_columns", "qsa_score_submit_us", "qsa_topk_submit_us",
+                    "qsa_attend_submit_us",
+                )
+                snapshot = {k: int(ple[k]) for k in keys if k in ple}
+            self.send_result([StatusMsg(
+                uid=int(uid), stage=str(stage), seq=seq,
+                timestamp=time.monotonic(), ple=snapshot, error=error,
+            )])
+        except Exception:
+            # Queue/HWM/worker teardown must not stall or fail GPU scheduling.
+            return
 
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:

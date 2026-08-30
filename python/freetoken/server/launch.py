@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from freetoken.distributed import DistributedInfo
+from freetoken.engine.config import DEFAULT_REQUEST_TIMEOUT_S
 from freetoken.utils import init_logger
 
 if TYPE_CHECKING:
@@ -68,6 +69,7 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
 
     import torch
     from freetoken.scheduler import Scheduler
+    logger = init_logger(__name__, f"scheduler_{args.tp_info.rank}")
 
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
@@ -100,7 +102,36 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
                 meta = compute_cache_status_meta(scheduler.engine)
                 # the parent must not touch CUDA to learn this
                 meta["gpus"] = scheduler.gpus
+                # ``compute_cache_status_meta`` owns storage topology.  Do not
+                # overwrite it with legacy hardcoded file-backed/GPU claims.
+                meta["ple_probe"] = dict(getattr(scheduler.engine, "ple_probe", {}) or {})
+                meta["ple_probe_timeout_s"] = float(getattr(args, "ple_probe_timeout_s", 300.0))
                 ack_queue.put(("meta", meta))
+                from .args import resolve_admission_limits
+
+                _running, pending, total = resolve_admission_limits(args)
+                storage = meta.get("storage") or {}
+                ple = storage.get("ple") or {}
+                experts = storage.get("expert_banks") or {}
+                logger.info(
+                    "Startup topology: dense=%s experts=%s ple=%s sidecar=%s "
+                    "ple_ram=%dMiB ple_gpu=%dMiB ple_staging=%dMiB io=%s depth=%s "
+                    "probe=%s probe_elapsed=%.1fs request_timeout=%.1fs heartbeat=%.1fs "
+                    "pending=%d total=%d",
+                    (storage.get("dense_tensors") or {}).get("source_policy", "unknown"),
+                    experts.get("source_policy", "unknown"),
+                    ple.get("mode", "none"), ple.get("sidecar", "none"),
+                    int(ple.get("ram_budget_bytes", 0) or 0) >> 20,
+                    int(ple.get("gpu_budget_bytes", 0) or 0) >> 20,
+                    int(ple.get("staging_budget_bytes", 0) or 0) >> 20,
+                    ple.get("io", "unknown"), ple.get("io_depth", "unknown"),
+                    meta.get("ple_probe", {}).get("state", "unknown"),
+                    float(meta.get("ple_probe", {}).get("elapsed_s", 0.0) or 0.0),
+                    float(getattr(args, "request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S)),
+                    float(getattr(args, "sse_heartbeat_s", 15.0)),
+                    pending,
+                    total,
+                )
             except Exception:  # noqa: BLE001 -- metadata is a nicety; readiness is not
                 pass
             ack_queue.put("Scheduler is ready")

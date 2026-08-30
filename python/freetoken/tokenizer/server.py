@@ -20,6 +20,8 @@ from freetoken.message import (
     DetokenizeMsg,
     ErrorReplyMsg,
     PromptAdmittedMsg,
+    StatusMsg,
+    StatusReply,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -61,6 +63,18 @@ def _put_user_replies(send_frontend: Any, replies: List[UserReply]) -> None:
         send_frontend.put(
             replies[0] if len(replies) == 1 else BatchFrontendMsg(data=replies)
         )
+
+
+def _put_status_replies(send_frontend: Any, messages: List[StatusMsg]) -> None:
+    if messages:
+        replies = [
+            StatusReply(
+                uid=m.uid, stage=m.stage, seq=m.seq, timestamp=m.timestamp,
+                ple=m.ple, error=m.error,
+            )
+            for m in messages
+        ]
+        send_frontend.put(replies[0] if len(replies) == 1 else BatchFrontendMsg(data=replies))
 
 
 def _send_generation_replies(
@@ -167,6 +181,7 @@ def tokenize_worker(
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
             prompt_admitted_msg = [m for m in pending_msg if isinstance(m, PromptAdmittedMsg)]
+            status_msg = [m for m in pending_msg if isinstance(m, StatusMsg)]
             error_reply_msg = [m for m in pending_msg if isinstance(m, ErrorReplyMsg)]
             # Cache-rebuild control messages are pure passthrough (no tokenization):
             # CacheRebuildMsg (api -> scheduler) and CacheRebuildResultMsg (scheduler -> api).
@@ -197,7 +212,7 @@ def tokenize_worker(
             n_control = sum(
                 isinstance(
                     m,
-                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg),
+                    (CacheRebuildMsg, CacheRebuildResultMsg, ErrorReplyMsg, PromptAdmittedMsg, StatusMsg),
                 )
                 for m in pending_msg
             )
@@ -240,6 +255,9 @@ def tokenize_worker(
                 sampled_replies,
                 [_error_reply(msg) for msg in error_reply_msg],
             )
+            # Telemetry is deliberately separate from UserReply accounting and may be dropped by
+            # a bounded downstream queue without affecting generation.
+            _put_status_replies(send_frontend, status_msg)
 
             if len(tokenize_msg) > 0:
                 # Tokenize per-message so a single un-renderable request (e.g. a chat template

@@ -95,6 +95,10 @@ torch::Tensor ggml_dequantize(
     int64_t m,
     int64_t n,
     std::optional<at::ScalarType> const& dtype) {
+  TORCH_CHECK(
+      type != 20 || (n > 0 && n % 256 == 0),
+      "generic GGUF IQ4_NL dequantization requires n > 0 and n % 256 == 0; got n=", n,
+      ". Use the dedicated five-block PLE dequant helper for 160-wide rows.");
   const GGUF_DEVICE_GUARD(device_of(W));
   auto dtype_ = dtype.value_or(torch::kFloat16);
   auto options = torch::TensorOptions().dtype(dtype_).device(W.device());

@@ -56,10 +56,24 @@ def fused_topk(
             # triton_kernels used to fail fast with ImportError; keep the misconfiguration
             # visible without giving up the fallback that Windows needs.
             logger.warning_rank0(
-                "fused_topk: triton_kernels is not installed -> pure-torch router fallback "
-                "(numerically equivalent, slower). Expected on Windows (no wheel); on Linux "
-                "install triton_kernels to restore the fused router."
+                "fused_topk: triton_kernels is not installed -> vendored CUDA router "
+                "fallback; CPU keeps pure-torch routing. Install triton_kernels on Linux "
+                "to restore its fused router."
             )
+        # Qwen4Exp's top-10 route must not fall back to synchronizing/launch-heavy
+        # torch.softmax + torch.topk on every MoE layer. The in-tree router supports
+        # non-power-of-two K and runs on ROCm through Triton's CUDA API. CPU remains
+        # on the reference path used by tests and non-CUDA inference.
+        if gating_output.is_cuda and torch.version.hip is None:
+            from freetoken.kernel.triton.moe_router import fused_topk_softmax
+
+            return fused_topk_softmax(gating_output, topk, renormalize, num_token_non_padded)
+        return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
+
+    # The optional triton_kernels router is CUDA-only in production.  On ROCm,
+    # gfx1100 can leave its fused top-k launch waiting forever; Torch top-k is
+    # slower but bounded and preserves exact routing semantics.
+    if gating_output.is_cuda and torch.version.hip is not None:
         return _torch_fused_topk(gating_output, topk, renormalize, num_token_non_padded)
 
     if topk & (topk - 1):

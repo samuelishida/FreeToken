@@ -117,7 +117,7 @@ class DSV4OffloadMoELayer(OffloadMoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=True,

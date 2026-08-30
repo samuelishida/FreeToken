@@ -14,7 +14,7 @@ from typing import List, Tuple
 
 # Every pool the rebuild endpoint knows about, and the unit a user types it in. Which of them
 # a given model actually has is decided per server -- see CachePools.
-CACHE_UNITS = {"moe": "slots", "kv": "tokens", "mamba": "slots", "swa": "tokens"}
+CACHE_UNITS = {"moe": "slots", "kv": "tokens", "mamba": "slots", "swa": "tokens", "ple": "pages"}
 
 
 def _int(source: dict, key: str) -> int:
@@ -38,13 +38,15 @@ class CachePools:
     kv: bool = True  # every model has a KV pool; the rebuild endpoint always takes num_pages
     mamba: bool = False
     swa: bool = False
+    ple: bool = False
 
     @property
     def targets(self) -> Tuple[str, ...]:
         return tuple(
             name
             for name, present in (
-                ("moe", self.moe), ("kv", self.kv), ("mamba", self.mamba), ("swa", self.swa)
+                ("moe", self.moe), ("kv", self.kv), ("mamba", self.mamba), ("swa", self.swa),
+                ("ple", self.ple)
             )
             if present
         )
@@ -58,6 +60,8 @@ class CachePools:
             mamba=bool(_int(geometry, "num_mamba_slots") or _int(unit, "mamba_per_slot")),
             # swa_page_size is the definitive signal: it is only non-zero for a window pool.
             swa=bool(_int(geometry, "swa_page_size") or _int(unit, "swa_per_token")),
+            ple=bool(_int(geometry, "ple_pages") or _int(geometry, "ple_ram_bytes")
+                     or _int(geometry, "ple_gpu_bytes") or _int(geometry, "ple_page_bytes")),
         )
 
 
@@ -124,6 +128,10 @@ def pool_bytes(geometry: dict, pool: str, units: int | None = None) -> int:
     if pool == "swa":
         pages = _int(geometry, "num_swa_pages") if units is None else units
         return pages * _int(geometry, "swa_page_size") * _int(unit_bytes, "swa_per_token")
+    if pool == "ple":
+        # New servers report packed rows in both host RAM and GPU cache. VRAM column must use
+        # GPU bytes; fallback keeps old nested-only status documents readable.
+        return _int(geometry, "ple_gpu_bytes") or _int(geometry, "ple_ram_bytes")
     return 0
 
 
@@ -168,6 +176,16 @@ def cache_status_rows(geometry: dict) -> List[Tuple[str, str, int, str]]:
     mamba = _int(geometry, "num_mamba_slots")
     if mamba > 0:  # hybrid (GDN) models only
         rows.append(_row("mamba", f"{mamba} slots"))
+    if pools.ple:
+        pages = _int(geometry, "ple_pages")
+        ram = _int(geometry, "ple_ram_bytes")
+        gpu = _int(geometry, "ple_gpu_bytes")
+        detail = f"{pages} pages" if pages > 0 else ""
+        if ram > 0:
+            detail += f" ({format_bytes(ram)} RAM)"
+        if gpu > 0:
+            detail += f" ({format_bytes(gpu)} GPU)"
+        rows.append(_row("ple", detail))
     swa_pages = _int(geometry, "num_swa_pages")
     if swa_page_size > 0 and swa_pages > 0:  # SWA (window pool) models only
         rows.append(_row("swa", format_tokens(swa_pages, swa_page_size)))

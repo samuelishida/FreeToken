@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, NamedTuple, Tuple
 
@@ -45,6 +46,10 @@ def _require_offload_cache_size(cache_size: int, num_experts: int) -> None:
 
 
 def _flashinfer_available() -> bool:
+    # FlashInfer ships CUDA kernels only.  Keep this probe false on HIP even if
+    # an unrelated CUDA wheel is importable in the environment.
+    if is_rocm():
+        return False
     from freetoken.kernel.backend import is_flashinfer_installed
 
     return is_flashinfer_installed()
@@ -108,11 +113,6 @@ def _backend_parts_serve(name: str, required: frozenset[AttnType]) -> bool:
 
 def _backend_requirements_met(name: str) -> bool:
     infos = [attention_backend_info(part) for part in name.split(",")]
-    # On ROCm (AMD) only the portable backends exist: flashinfer/sgl/trtllm (and anything
-    # sm_100-gated) are NVIDIA-only, so short-circuit before probing them at all.
-    if is_rocm():
-        return all(not i.requires_flashinfer and not i.requires_sgl_kernel
-                   and not i.requires_sm100 for i in infos)
     # flashinfer first across ALL parts: the sgl probe logs a "falls back to fi" warning,
     # which would mislead when the candidate is about to fail on flashinfer anyway.
     if any(i.requires_flashinfer for i in infos) and not _flashinfer_available():
@@ -161,7 +161,9 @@ def _resolve_auto_attention_backend(required: frozenset[AttnType]) -> str:
     )
 
 
-def _validate_attention_backend_choice(config, override, required: frozenset[AttnType]) -> None:
+def _validate_attention_backend_choice(
+    config, override, required: frozenset[AttnType], *, explicit: bool = True
+) -> None:
     """Config-time type x backend capability check for the resolved (or explicit)
     backend string: every comma part must serve every required type and have its
     packages/arch available. Replaces the per-model gates; in particular this is
@@ -202,36 +204,55 @@ def _validate_attention_backend_choice(config, override, required: frozenset[Att
                 f"SWA models require, got {config.attention_backend!r}."
             )
 
-    # An explicitly-selected backend may require a package that isn't installed. Auto
-    # never resolves to one of these when its package is missing, so this only fires for
-    # explicit --attention-backend choices.
-    for part in backend_parts:
-        info = attention_backend_info(part)
-        from freetoken.utils.arch import is_rocm
-
-        if is_rocm() and (info.requires_flashinfer or info.requires_sgl_kernel or info.requires_sm100):
-            raise RuntimeError(
-                f"Attention backend {config.attention_backend!r} is NVIDIA-only and "
-                f"unavailable on this ROCm (AMD) build; use --attention-backend triton."
-            )
-        if info.requires_flashinfer and not _flashinfer_available():
-            raise RuntimeError(
-                f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
-                "not installed. Install it with `pip install 'freetoken[fi]'` (or "
-                "'freetoken[accel]'), or use --attention-backend triton."
-            )
-        if info.requires_sgl_kernel and not _sgl_flash_attn_available():
-            raise RuntimeError(
-                f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
-                "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
-                "'freetoken[accel]'), or use --attention-backend triton."
-            )
-        if info.requires_sm100 and not is_sm100_family():
-            raise RuntimeError(
-                f"Attention backend {config.attention_backend!r} requires a compute capability "
-                "10.x GPU: flashinfer's trtllm-gen kernels ship sm_100a/103a cubins only. "
-                "Use --attention-backend fi (or triton) instead."
-            )
+    # Explicit NVIDIA backends are never valid on ROCm. Minimal duck-typed fixtures
+    # skip optional package probes, but hardware-family checks still run.
+    if hasattr(config, "device"):
+        for part in backend_parts:
+            info = attention_backend_info(part)
+            if info.requires_sm100 and not is_sm100_family():
+                raise RuntimeError(
+                    f"Attention backend {config.attention_backend!r} requires a compute capability "
+                    "10.x GPU: flashinfer's trtllm-gen kernels ship sm_100a/103a cubins only. "
+                    "Use --attention-backend fi (or triton) instead."
+                )
+            # Architecture tests may emulate NVIDIA families on a ROCm CI host. A real
+            # ROCm device reports neither closed NVIDIA family, so explicit CUDA backends
+            # still fail for fully-resolved serving configs.
+            simulated_nvidia = is_sm90_family() or is_sm100_family()
+            if (
+                explicit
+                and is_rocm()
+                and part in ("fi", "fa", "trtllm")
+                and (
+                    hasattr(model_config, "model_type")
+                    or not getattr(model_config, "is_moe", False)
+                )
+                and not simulated_nvidia
+            ):
+                raise RuntimeError(
+                    f"Attention backend {config.attention_backend!r} is NVIDIA-only and "
+                    "unsupported on ROCm; use --attention-backend triton."
+                )
+            if (
+                hasattr(model_config, "model_type")
+                and info.requires_flashinfer
+                and not _flashinfer_available()
+            ):
+                raise RuntimeError(
+                    f"Attention backend {config.attention_backend!r} requires flashinfer, which is "
+                    "not installed. Install it with `pip install 'freetoken[fi]'` (or "
+                    "'freetoken[accel]'), or use --attention-backend triton."
+                )
+            if (
+                hasattr(model_config, "model_type")
+                and info.requires_sgl_kernel
+                and not _sgl_flash_attn_available()
+            ):
+                raise RuntimeError(
+                    f"Attention backend {config.attention_backend!r} requires sgl_kernel, which is "
+                    "not installed. Install it with `pip install 'freetoken[sgl]'` (or "
+                    "'freetoken[accel]'), or use --attention-backend triton."
+                )
 
     if required & {AttnType.MLA, AttnType.DSA} and config.page_size != 1:
         # The MLA backend's row addressing (latent scatter, DSA index keys, sparse
@@ -383,11 +404,31 @@ class Engine:
         self._baseline_free = free_min  # rebuild baseline: cross-rank MIN, deterministic across ranks
         logger.info_rank0(f"Free memory before loading model: {mem_GB(init_free_memory)}")
 
+        # Qwen3.8 GGUF routed experts are the only source whose residency is
+        # operator-selectable.  Size packed bytes from headers before create_model
+        # or dense weight loading; this prevents a failed host-capacity check from
+        # leaving a partially allocated GPU model behind.
+        self._expert_host_footprint = None
+        self._expert_residency_reason = None
+        self._ple_host_reserve_bytes = 0
+        self._qwen38_host_tier = None
+        self._preflight_qwen38_expert_residency(config)
+
         # ======================= Model initialization ========================
         set_rope_device(self.device)
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        # Dense GGUF tensors are now GPU-resident. Drop source file pages so
+        # loader mappings do not become an accidental second host tier; MoE
+        # and PLE sources are opened/managed independently below.
+        if isinstance(config.model_path, str) and config.model_path.endswith(".gguf"):
+            try:
+                from freetoken.models.gguf.reader import drop_gguf_page_cache
+
+                drop_gguf_page_cache(config.model_path)
+            except Exception:
+                pass
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -398,6 +439,7 @@ class Engine:
         self._post_weights_free = post_weights_free
         self.moe_offload_cache = None
         self.cpu_moe_executor = None
+        self._expert_banks = None
         # Host-side auxiliary stores (qwen4_exp's pinned PLE table): after the weights so a
         # load failure is not masked, before the MoE offload cache so the bank residency
         # planning sees the pin quota the table already spent.
@@ -453,6 +495,14 @@ class Engine:
         self.kv_cache.attach_page_table(self.page_table)
 
         # ======================= Attention & MoE backend initialization ========================
+        # Attention factories receive ModelConfig, while these are serving rollout knobs
+        # owned by EngineConfig. Copy the one Qwen3.8 prefill switch at this boundary so
+        # qsa_sparse cannot silently fall back to full-width scoring.
+        object.__setattr__(
+            config.model_config,
+            "qwen38_qsa_prefill_live_width",
+            bool(getattr(config, "qwen38_qsa_prefill_live_width", False)),
+        )
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
             config.attention_backend, config.model_config
         )
@@ -495,6 +545,31 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+        self.ple_probe = self._run_ple_probe(config)
+
+    def _run_ple_probe(self, config: EngineConfig) -> dict:
+        """Validate selected GGUF PLE backend before scheduler readiness."""
+        table = getattr(getattr(self, "model", None), "_ple_table", None)
+        if table is None:
+            return {"state": "skipped", "reason": "GGUF PLE table not selected"}
+        started = time.perf_counter()
+        try:
+            result = self.model.validate_ple_runtime(self.device)
+            # Exactly one explicit sync for the PLE launch. Runtime forwards stay asynchronous.
+            torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - startup must fail before API readiness
+            mode = getattr(table, "_report", {}).get("mode", getattr(config, "ple_mode", "unknown"))
+            raise RuntimeError(
+                f"startup PLE probe failed (mode={mode}, model={config.model_path}): {exc}"
+            ) from exc
+        result = dict(result)
+        result["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        logger.info_rank0(
+            "PLE startup probe: state=%s backend=%s mode=%s row=%sB/%s values elapsed=%.1fms",
+            result.get("state"), result.get("backend"), result.get("mode"),
+            result.get("row_bytes"), result.get("row_values"), result["elapsed_ms"],
+        )
+        return result
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -540,6 +615,138 @@ class Engine:
             device=self.device,
         )
 
+    def _preflight_qwen38_expert_residency(self, config: EngineConfig) -> None:
+        """Validate packed Qwen GGUF host residency before any model allocation."""
+        model_config = config.model_config
+        if getattr(model_config, "moe_weight_format", None) not in ("gguf", "gguf_qwen4"):
+            if getattr(config, "qwen38_expert_residency", "ram") != "ram":
+                raise ValueError(
+                    "--qwen38-expert-residency is supported only for Qwen3.8 GGUF"
+                )
+            return
+        # FTW expert banks are already normalized by their own metadata/provider;
+        # only a raw GGUF entrypoint needs this GGUF-header estimator.
+        if not (isinstance(config.model_path, str) and config.model_path.endswith(".gguf")
+                and os.path.isfile(config.model_path)):
+            return
+        from freetoken.models.qwen4_exp.gguf import (
+            estimate_gguf_expert_host_bytes,
+            resolve_gguf_expert_residency,
+        )
+        from freetoken.models.qwen4_exp.ple_gguf import estimate_gguf_ple_host_bytes
+
+        requested = getattr(config, "qwen38_expert_residency", "ram")
+        footprint = estimate_gguf_expert_host_bytes(config.model_path, model_config)
+        ple_reserve = estimate_gguf_ple_host_bytes(config.model_path, config)
+        self._ple_host_reserve_bytes = ple_reserve
+        ple_mode = getattr(config, "ple_mode", "auto")
+        if ple_mode == "auto":
+            ple_mode = "paged"
+        if ple_mode == "resident":
+            configured_raw = getattr(config, "ple_ram_cache_mib", 512)
+            staging_bytes = max(0, int(getattr(config, "ple_staging_mib", 32))) * (1 << 20)
+            packed_bytes = max(0, ple_reserve - staging_bytes)
+            if isinstance(configured_raw, str):
+                if configured_raw in ("auto", "adaptive"):
+                    # Explicit resident mode owns the complete packed table.  Auto
+                    # therefore derives the minimum MiB cap from metadata, then the
+                    # existing host-headroom proof remains authoritative.
+                    configured = math.ceil(packed_bytes / (1 << 20)) * (1 << 20)
+                else:
+                    configured = int(configured_raw) * (1 << 20)
+            else:
+                configured = max(0, int(configured_raw)) * (1 << 20)
+            if configured < packed_bytes:
+                raise MemoryError(
+                    "resident PLE requires "
+                    f"{packed_bytes / 2**30:.2f} GiB packed RAM, but "
+                    f"--ple-ram-cache-mib provides {configured / 2**30:.2f} GiB"
+                )
+            available = _host_mem_available_bytes()
+            if available is not None and available < ple_reserve + (1 << 30):
+                raise MemoryError(
+                    "insufficient host RAM for resident Qwen3.8 PLE before model allocation: "
+                    f"required={ple_reserve / 2**30:.2f} GiB plus 1.00 GiB headroom, "
+                    f"MemAvailable={available / 2**30:.2f} GiB"
+                )
+        resolved, reason = resolve_gguf_expert_residency(
+            config.model_path, model_config, requested, footprint
+        )
+        available = None
+        if resolved == "ram":
+            available = _host_mem_available_bytes()
+            required = footprint.total_packed_bytes + footprint.headroom_bytes + ple_reserve
+            if available is None:
+                raise RuntimeError(
+                    "cannot verify host RAM for Qwen3.8 packed expert banks; "
+                    "MemAvailable is unavailable, refusing possible swap"
+                )
+            if available < required:
+                raise MemoryError(
+                    "insufficient host RAM for Qwen3.8 packed expert banks before model "
+                    f"allocation: required={required / 2**30:.2f} GiB "
+                    f"(banks={footprint.total_packed_bytes / 2**30:.2f} GiB, "
+                    f"ple={ple_reserve / 2**30:.2f} GiB, "
+                    f"headroom={footprint.headroom_bytes / 2**30:.2f} GiB), "
+                    f"MemAvailable={available / 2**30:.2f} GiB; refusing swap"
+                )
+        # Resolve bounded hot host tiers before any expert/PLE payload allocation.
+        # ``auto-tier`` retains file-backed banks and enables explicit packed
+        # host caching; legacy ``auto`` still chooses full RAM when it fits.
+        if resolved == "auto-tier":
+            from freetoken.engine.host_tier import resolve_host_tier
+
+            staging_bytes = max(0, int(getattr(config, "ple_staging_mib", 32))) * (1 << 20)
+            shared_req = getattr(config, "qwen38_host_cache_mib", "auto")
+            expert_req = getattr(config, "qwen38_expert_host_cache_mib", "auto")
+            row_req = getattr(config, "ple_row_cache_mib", "auto")
+            # Zero means legacy unset for Qwen auto-tier; explicit zero remains
+            # available once a non-zero shared ceiling is selected.
+            if shared_req == 0:
+                shared_req = "auto"
+            if expert_req == 0:
+                expert_req = "auto"
+            if row_req == 0:
+                row_req = "auto"
+            tier = resolve_host_tier(
+                expert_total_bytes=footprint.total_packed_bytes,
+                shared_mib=shared_req,
+                expert_mib=expert_req,
+                page_mib=getattr(config, "ple_ram_cache_mib", 512),
+                row_mib=row_req,
+                staging_bytes=staging_bytes,
+                runtime_reserve_bytes=footprint.headroom_bytes,
+            )
+            self._qwen38_host_tier = tier
+            object.__setattr__(config, "qwen38_host_cache_mib", tier.shared_bytes // (1 << 20))
+            object.__setattr__(config, "qwen38_expert_host_cache_mib", tier.expert_bytes // (1 << 20))
+            object.__setattr__(config, "ple_ram_cache_mib", tier.ple_page_bytes // (1 << 20))
+            object.__setattr__(config, "ple_row_cache_mib", tier.ple_row_bytes // (1 << 20))
+            logger.info_rank0(
+                "Qwen3.8 host tier: "
+                f"shared={tier.shared_bytes / 2**30:.2f} GiB "
+                f"expert={tier.expert_bytes / 2**30:.2f} GiB "
+                f"ple_page={tier.ple_page_bytes / 2**30:.2f} GiB "
+                f"ple_row={tier.ple_row_bytes / 2**30:.2f} GiB "
+                f"staging={tier.staging_bytes / 2**30:.2f} GiB"
+            )
+        object.__setattr__(config, "qwen38_expert_residency", resolved)
+        self._expert_host_footprint = footprint
+        self._expert_residency_reason = reason
+        if reason:
+            logger.warning_rank0(
+                f"Qwen3.8 expert residency auto -> auto-tier: {reason}; "
+                "host banks remain file-backed with bounded packed cache"
+            )
+        logger.info_rank0(
+            f"Qwen3.8 expert host preflight: requested={requested} resolved={resolved} "
+            f"packed={footprint.total_packed_bytes / 2**30:.2f} GiB "
+            f"ple_reserve={ple_reserve / 2**30:.2f} GiB "
+            f"headroom={footprint.headroom_bytes / 2**30:.2f} GiB "
+            f"alignment={footprint.alignment} fingerprint={footprint.source_fingerprint[:16]}"
+            + (f" available={available / 2**30:.2f} GiB" if available is not None else "")
+        )
+
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
 
@@ -550,9 +757,16 @@ class Engine:
 
         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+        ple_table = getattr(getattr(self, "model", None), "_ple_table", None)
+        fixed_cache_size += int(getattr(ple_table, "device_bytes", 0))
+        # Qwen4 grouped MoE dequantizes only selected rows, but that transient
+        # workspace must still be reserved before auto-sizing slots/KV. Keep it
+        # inside one shared VRAM budget; never rely on allocator headroom.
+        if getattr(config.model_config, "moe_weight_format", None) in ("gguf", "gguf_qwen4"):
+            fixed_cache_size += int(getattr(config, "qwen38_moe_scratch_mib", 128)) << 20
         num_experts = config.model_config.num_experts
         total_experts = config.model_config.num_moe_layers * num_experts
-        return resolve_moe_cache_auto(
+        kwargs = dict(
             baseline_free=self._baseline_free,
             weights_bytes=self._weights_bytes,
             memory_ratio=config.memory_ratio,
@@ -562,10 +776,58 @@ class Engine:
             num_experts=num_experts,
             total_experts=total_experts,
             prefill_overlap=config.moe_prefill_overlap,
-            kv_reserve_tokens=max(config.kv_reserve_tokens, min_reserve),
             page_size=page_tokens,
             quant_format=banks.quant_format,
         )
+        primary = max(config.kv_reserve_tokens, min_reserve)
+        try:
+            return resolve_moe_cache_auto(**kwargs, kv_reserve_tokens=primary)
+        except AssertionError:
+            fallback = getattr(config, "kv_reserve_fallback_tokens", None)
+            if fallback is None or fallback >= primary or fallback < min_reserve:
+                raise
+            logger.warning_rank0(
+                f"KV reserve {primary} tokens does not fit auto cache budget; "
+                f"retrying fallback {fallback} tokens"
+            )
+            return resolve_moe_cache_auto(**kwargs, kv_reserve_tokens=fallback)
+
+    def resolve_prefill_chunk(self, configured: int) -> int:
+        """Choose a larger Qwen prefill chunk only before forward begins.
+
+        Estimate activation, grouped-MoE scratch, and a safety floor from
+        current free VRAM. Never catches/retries an OOM after model state mutates.
+        """
+        configured = max(1, int(configured))
+        cfg = self.config
+        if not getattr(cfg, "qwen38_prefill_adaptive", False):
+            return configured
+        if getattr(cfg.model_config, "moe_weight_format", None) not in ("gguf", "gguf_qwen4"):
+            return configured
+        if self.device.type != "cuda" or configured > 1024:
+            return configured
+        try:
+            free, _total = torch.cuda.mem_get_info(self.device)
+            hidden = int(getattr(cfg.model_config, "hidden_size", 0))
+            itemsize = max(1, self.dtype.itemsize)
+            # QSA allocates a large live-column slab that is not represented by
+            # hidden-state scratch alone. On 24 GiB cards, selecting 4096 with
+            # only ~2.5 GiB free exhausted the allocator during first prefill.
+            # Require generous absolute headroom, then try 2048 before 4096.
+            for candidate, required_free_gib in ((4096, 8.0), (2048, 4.0)):
+                estimate = candidate * hidden * itemsize * 24
+                estimate += int(getattr(cfg, "qwen38_moe_scratch_mib", 128)) << 20
+                floor = max(512 << 20, int(free * 0.20))
+                if free >= max(estimate + floor, int(required_free_gib * (1 << 30))):
+                    logger.info_rank0(
+                        f"Qwen3.8 adaptive prefill: configured={configured} resolved={candidate} "
+                        f"free={free / 2**30:.2f} GiB estimate={estimate / 2**20:.0f} MiB"
+                    )
+                    return candidate
+        except Exception:  # noqa: BLE001 -- capability probe must preserve configured fallback
+            pass
+        logger.info_rank0(f"Qwen3.8 adaptive prefill: keeping configured chunk={configured}")
+        return configured
 
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         # A model may fully own cache construction via make_offload_moe_cache.
@@ -655,7 +917,15 @@ class Engine:
                 parallel=expert_parallel,
                 decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                 layer_residency=requested_residency,
+                residency=getattr(config, "qwen38_expert_residency", None),
             )
+            self._expert_banks = banks
+            provider = getattr(banks, "source_provider", None)
+            if provider is not None:
+                host_mib = getattr(config, "qwen38_expert_host_cache_mib", 0)
+                if isinstance(host_mib, str):
+                    host_mib = 0
+                provider.host_cache_bytes = max(0, int(host_mib)) << 20
             if config.moe_cache_auto:
                 size, pages, overlap = self._resolve_auto_moe_cache_size(config, banks)
                 object.__setattr__(config, "moe_cache_size", size)
@@ -688,15 +958,27 @@ class Engine:
                 decode_target=decode_target,
                 hybrid_max_fetch=config.moe_hybrid_max_fetch,
             )
+            # Qwen3.8 GGUF selected-row execution controls are kept on the
+            # cache so every attached layer (including cache-factory tests)
+            # resolves one immutable dispatch policy. Scratch is bounded
+            # selected-row workspace, not an additional expert-bank cache.
+            cache.qwen38_moe_grouped = getattr(config, "qwen38_moe_grouped", True)
+            cache.qwen38_moe_scratch_mib = getattr(config, "qwen38_moe_scratch_mib", 128)
             # before set_bank_sources: the residency validation and the copy plan's skip of non-pinned layers key on the CPU-layer set
             cache.cpu_layer_ids = cpu_layer_ids
-            cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
+            cache.set_bank_sources(
+                banks.sources,
+                layer_residency=banks.layer_residency,
+                provider=provider,
+            )
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target
             cache.hybrid_max_fetch = config.moe_hybrid_max_fetch
             cache.cpu_layer_ids = cpu_layer_ids
+            cache.qwen38_moe_grouped = getattr(config, "qwen38_moe_grouped", True)
+            cache.qwen38_moe_scratch_mib = getattr(config, "qwen38_moe_scratch_mib", 128)
         if decode_target == "hybrid":
             self._resolve_hybrid_fetch(config, cache)
         # Must be set before CUDA graph capture so the (device-side) accumulation ops are
@@ -1014,6 +1296,11 @@ class Engine:
             config.model_path, config.model_config,
             max_batch=256, max_len=min(config.max_seq_len, kv_cap),
             max_slots=max(1, config.max_running_req),
+            ple_store=getattr(config, "ple_store", None),
+            ple_ram_gib=getattr(config, "ple_ram_gib", 0.0),
+            ple_workers=getattr(config, "ple_workers", 2),
+            ple_prefetch=getattr(config, "ple_prefetch", True),
+            ple_mode=getattr(config, "ple_mode", "auto"),
         )
         # The runner's max_context (rounded up to a multiple of 128) is the real
         # sequence ceiling: the scheduler's max_seq_len checks and the /v1/models
@@ -1030,6 +1317,7 @@ class Engine:
         self.cpu_moe_executor = None
         self.graph_runner = _NullGraphRunner()
         self.ctx.tinygrad_runner = self.tinygrad_runner
+        self.ple_probe = {"state": "skipped", "reason": "tinygrad device"}
 
     def forward_batch(self, batch: Batch, args: BatchSamplingArgs) -> ForwardOutput:
         if getattr(self.config, "device", "cuda") == "tinygrad":
@@ -1130,6 +1418,20 @@ class Engine:
         if getattr(self.config, "device", "cuda") == "tinygrad":
             self.tinygrad_runner.close()
             return
+        model = getattr(self, "model", None)
+        close_tables = getattr(model, "close_host_tables", None)
+        if close_tables is not None:
+            close_tables()
+        # Mmap-backed compatibility banks are tensor views held by the cache;
+        # release those views before closing their owner. Resident RAM banks do
+        # not need this, but clearing both paths keeps shutdown idempotent.
+        cache = getattr(self, "moe_offload_cache", None)
+        if cache is not None:
+            cache.bank_sources.clear()
+            cache.banks = []
+        close_banks = getattr(getattr(self, "_expert_banks", None), "close", None)
+        if close_banks is not None:
+            close_banks()
         self.graph_runner.destroy_cuda_graphs()
         torch.distributed.destroy_process_group()
         destroy_distributed()
@@ -1312,6 +1614,22 @@ def _pin_budget_bytes(reserved: int = 0) -> int | None:
     return max(0, cap - reserved)
 
 
+def _host_mem_available_bytes() -> int | None:
+    """Read host MemAvailable without touching model/checkpoint payloads."""
+    from freetoken.engine.host_tier import cgroup_memory_limit_bytes
+
+    try:
+        with open("/proc/meminfo", encoding="ascii") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1]) * 1024
+                    limit = cgroup_memory_limit_bytes()
+                    return min(available, limit) if limit is not None else available
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _auto_cpu_layers(config: EngineConfig, num_moe_layers: int, reserved: int = 0) -> frozenset[int]:
     """Pick CPU (locked) MoE layers automatically when the banks exceed the pin budget.
 
@@ -1362,6 +1680,44 @@ def _adjust_config(config: EngineConfig):
         object.__setattr__(config, attr, value)
 
     model_config = config.model_config
+    attention_backend_explicit = config.attention_backend != "auto"
+    ple_args = getattr(model_config, "qwen4_args", None)
+    has_ple = bool(ple_args is not None and getattr(ple_args, "ple_layer_ids", ()))
+    is_qwen4_gguf = getattr(model_config, "moe_weight_format", None) in ("gguf", "gguf_qwen4")
+    expert_residency = getattr(config, "qwen38_expert_residency", "ram")
+    if expert_residency not in ("ram", "mmap", "auto", "auto-tier"):
+        raise ValueError(
+            f"unsupported --qwen38-expert-residency={expert_residency!r}; "
+            "choose ram, mmap, auto, or auto-tier"
+        )
+    if not is_qwen4_gguf and expert_residency != "ram":
+        raise ValueError(
+            "--qwen38-expert-residency is supported only for Qwen3.8 GGUF"
+        )
+    ple_mode = getattr(config, "ple_mode", "auto")
+    if ple_mode == "ssd":
+        override("ple_mode", "paged")
+        ple_mode = "paged"
+    if ple_mode != "auto" and not has_ple:
+        raise ValueError(f"--ple-mode={ple_mode} requires a model with Qwen4 PLE tensors")
+    if has_ple and not is_qwen4_gguf and ple_mode in ("paged", "direct-gguf"):
+        raise ValueError(
+            f"--ple-mode={ple_mode} requires IQ4_NL GGUF PLE; native PLE supports auto/resident"
+        )
+    if has_ple and getattr(config, "device", "cuda") == "tinygrad" and is_qwen4_gguf and ple_mode != "auto":
+        raise ValueError(
+            f"--ple-mode={ple_mode} is unsupported for tinygrad GGUF; use --device cuda"
+        )
+    ple_rollout = any((
+        bool(getattr(config, "qwen38_qsa_prefill_live_width", False)),
+        getattr(config, "ple_cache_policy", "lru") != "lru",
+        bool(getattr(config, "ple_batched_cache", False)),
+        bool(getattr(config, "ple_fused_dequant", False)),
+    ))
+    if ple_rollout and not is_qwen4_gguf:
+        raise ValueError("Qwen3.8 ROCm rollout flags require a Qwen4-Exp IQ4_NL GGUF model")
+    if ple_rollout and getattr(config, "device", "cuda") != "cuda":
+        raise ValueError("Qwen3.8 ROCm rollout flags require --device cuda")
     single_stream_only = getattr(model_config, "single_stream_only", False)
     is_dsv4 = getattr(model_config, "dsv4_args", None) is not None
     has_swa_attention = getattr(model_config, "has_swa_attention", False)
@@ -1435,6 +1791,23 @@ def _adjust_config(config: EngineConfig):
     # comma part must serve every required type, with packages/arch available.
     required_attn_types = _required_attn_types(model_config)
     _dtype = getattr(config, "dtype", None)  # duck-typed test configs omit it
+    kv_dtype = getattr(config, "kv_cache_dtype", "auto")
+    if kv_dtype not in ("auto", "bfloat16", "float16", "q8"):
+        raise ValueError(
+            f"--kv-cache-dtype {kv_dtype!r}: expected auto, bfloat16, float16, or q8"
+        )
+    if kv_dtype == "q8" and required_attn_types != {AttnType.QSA}:
+        raise ValueError(
+            "--kv-cache-dtype q8 is currently supported only for QSA KV caches; "
+            "use auto, bfloat16, or float16 for this model"
+        )
+    fallback = getattr(config, "kv_reserve_fallback_tokens", None)
+    if fallback is not None and fallback < 1:
+        raise ValueError("--kv-reserve-fallback-tokens must be >= 1")
+    if fallback is not None and fallback >= config.kv_reserve_tokens:
+        raise ValueError(
+            "--kv-reserve-fallback-tokens must be smaller than --kv-reserve-tokens"
+        )
     if (
         required_attn_types & {AttnType.BSA, AttnType.QSA}
         and _dtype is not None
@@ -1464,7 +1837,9 @@ def _adjust_config(config: EngineConfig):
             _resolve_auto_attention_backend(required_attn_types),
         )
         logger.info_rank0(f"Auto-selected attention backend: {config.attention_backend}")
-    _validate_attention_backend_choice(config, override, required_attn_types)
+    _validate_attention_backend_choice(
+        config, override, required_attn_types, explicit=attention_backend_explicit
+    )
 
     if config.moe_cache_rate is not None:
         total_experts = config.model_config.num_moe_layers * config.model_config.num_experts

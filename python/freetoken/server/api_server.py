@@ -24,6 +24,7 @@ from freetoken.message import (
     BatchFrontendMsg,
     CacheRebuildMsg,
     CacheRebuildReply,
+    StatusReply,
     TokenizeMsg,
     UserReply,
 )
@@ -35,9 +36,9 @@ from freetoken.utils import (
 )
 from pydantic import BaseModel
 
-from .args import ServerArgs
+from .args import ServerArgs, resolve_admission_limits
 from .anthropic_api import register_anthropic_routes
-from .accounting import AdmissionClosedError, register_accounting_routes
+from .accounting import AdmissionBusyError, AdmissionClosedError, register_accounting_routes
 from .control_api import register_control_routes
 from .openai_api import register_openai_routes
 from . import request_ring
@@ -111,14 +112,14 @@ def _reap_backend_workers(processes: List[Any], timeout: float = 5.0) -> None:
             continue
 
 
-def _unwrap_msg(msg: BaseFrontendMsg) -> List[UserReply]:
+def _unwrap_msg(msg: BaseFrontendMsg) -> List[BaseFrontendMsg]:
     if isinstance(msg, BatchFrontendMsg):
         result = []
         for reply in msg.data:
-            assert isinstance(reply, UserReply)
+            assert isinstance(reply, (UserReply, StatusReply))
             result.append(reply)
         return result
-    assert isinstance(msg, UserReply)
+    assert isinstance(msg, (UserReply, StatusReply))
     return [msg]
 
 
@@ -137,6 +138,14 @@ class FrontendManager:
     initialized: bool = False
     ack_map: Dict[int, List[UserReply]] = field(default_factory=dict)
     event_map: Dict[int, asyncio.Event] = field(default_factory=dict)
+    # Event-loop-local idempotence gate. Timeout, disconnect, and shutdown can race; only
+    # first abort sends worker cancellation and decrements active accounting.
+    aborted_uids: set[int] = field(default_factory=set)
+    # Frontend admission counters are intentionally separate from scheduler
+    # token counters: queued requests are active from HTTP's perspective, but
+    # rejected requests never enter StatsTracker.inflight.
+    admission_rejected: int = 0
+    admission_cancelled: int = 0
     # Stable identity for this serve process. Generated before the backend is ready so every
     # /health state (loading/ok/error) and /v1/stats can identify the same engine generation.
     instance_id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -174,6 +183,13 @@ class FrontendManager:
     # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
     # (the running snapshot channel) has anything. None until meta arrives.
     cache_pools: Dict[str, int] | None = None
+    # Immutable/host-backed model storage metadata from the backend readiness ack. Kept
+    # separate from VRAM pool geometry so clients can distinguish GGUF mmap offload from
+    # resident weights and inspect PLE cache policy without probing worker internals.
+    storage_report: Dict[str, Any] | None = None
+    # Readiness probe result and independent parent deadline, surfaced by health/cache status.
+    ple_probe: Dict[str, Any] | None = None
+    ple_probe_timeout_s: float = 300.0
     # one {index, name, uuid, total_bytes} per TP rank, from the same ack; /v1/stats gpus
     gpus: List[Dict[str, Any]] = field(default_factory=list)
     # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
@@ -233,6 +249,15 @@ class FrontendManager:
             raise AdmissionClosedError(
                 f"server unavailable: engine is {self.maintenance_state}"
             )
+        # max_running_req sizes scheduler/KV tables, while PrefillManager already owns a
+        # bounded pending queue. Serial engines (Qwen4-Exp GGUF/tinygrad) must admit a small
+        # queue: Copilot can retry while one long prefill is active, and rejecting that retry
+        # as 429 makes a valid request fail even though scheduler capacity will free shortly.
+        _running, _pending, queue_limit = resolve_admission_limits(self.config)
+        active = int(getattr(self.stats, "active", 0) or 0)
+        if queue_limit > 0 and active >= queue_limit:
+            self.admission_rejected += 1
+            raise AdmissionBusyError(active, queue_limit)
         uid = self.uid_counter
         self.uid_counter += 1
         self.ack_map[uid] = []
@@ -247,6 +272,9 @@ class FrontendManager:
                 self._resolve_rebuild(msg)
                 continue
             for msg in _unwrap_msg(msg):
+                if isinstance(msg, StatusReply):
+                    self.stats.observe_status(msg)
+                    continue
                 # Global accounting follows actual admitted/sampled work even after the HTTP
                 # client disconnects and abort_user removes its ack queue. Delivery to a live
                 # request remains gated below, but observation must happen first.
@@ -364,16 +392,22 @@ class FrontendManager:
                     raise asyncio.CancelledError
                 yield chunk
         except asyncio.CancelledError:
-            asyncio.create_task(self.abort_user(uid))
+            # Await cleanup before propagating cancellation. Shield keeps the worker abort
+            # alive long enough to settle active-request accounting and is idempotent when a
+            # timeout handler already started the same operation.
+            await asyncio.shield(self.abort_user(uid))
             raise
 
     async def abort_user(self, uid: int):
-        await asyncio.sleep(0.1)
+        if uid in self.aborted_uids:
+            return
+        self.aborted_uids.add(uid)
         if uid in self.ack_map:
             del self.ack_map[uid]
         if uid in self.event_map:
             del self.event_map[uid]
         self.stats.on_abort(uid)
+        self.admission_cancelled += 1
         logger.warning("Aborting request for user %s", uid)
         await self.send_one(AbortMsg(uid=uid))
 
@@ -770,6 +804,8 @@ def cache_geometry(state: Any) -> dict:
         reasoning = _reasoning_geometry(state)
     except Exception:
         reasoning = None
+    admission_running, admission_pending, admission_total = resolve_admission_limits(config)
+    admission_active = int(getattr(state.stats, "active", 0) or 0)
     geo = {
         "num_pages": num_pages,
         "page_size": page_size,
@@ -792,7 +828,92 @@ def cache_geometry(state: Any) -> dict:
         # unknown (pre-budget engine) — the desktop then reverse-derives it from the limits.
         "cache_budget_bytes": int(getattr(state, "cache_budget_bytes", 0) or 0),
         "reasoning": reasoning,
+        "storage": getattr(state, "storage_report", None) or {},
+        "admission": {
+            "active": admission_active,
+            "pending": min(admission_pending, max(0, admission_active - admission_running)),
+            "rejected": int(getattr(state, "admission_rejected", 0) or 0),
+            "cancelled": int(getattr(state, "admission_cancelled", 0) or 0),
+            "max_running": admission_running,
+            "max_pending": admission_pending,
+            "max_total": admission_total,
+        },
     }
+    try:
+        ple_geometry = getattr(getattr(state, "engine", None), "tinygrad_runner", None)
+        if ple_geometry is not None:
+            geo.update(ple_geometry.ple_cache_geometry())
+    except Exception:
+        pass
+    # Standard ROCm/GGUF exposes the same topology through model storage_report. Keep the
+    # detailed nested object for compatibility, but promote geometry so cache clients never
+    # mistake host RAM for VRAM.
+    ple = (geo.get("storage") or {}).get("ple")
+    if isinstance(ple, dict):
+        live_ple = dict(getattr(state.stats, "ple_counters", {}) or {})
+        geo.update({
+            "ple_mode": ple.get("mode"),
+            "ple_backend": ple.get("backend"),
+            "ple_sidecar": ple.get("sidecar"),
+            "ple_sidecar_fingerprint": ple.get("sidecar_fingerprint") or ple.get("source_fingerprint"),
+            "ple_source_policy": ple.get("source_policy"),
+            "ple_io_backend": ple.get("io_backend", ple.get("io")),
+            "ple_pages": (int(ple.get("num_rows", 0)) + 44) // 45,
+            "ple_page_bytes": 4096,
+            "ple_ram_bytes": int(ple.get("ram_budget_bytes", 0) or 0),
+            "ple_row_cache_bytes": int(ple.get("row_cache_budget_bytes", 0) or 0),
+            "ple_row_cache_resident_bytes": int(ple.get("row_cache_resident_bytes", 0) or 0),
+            "ple_gpu_bytes": int(ple.get("gpu_budget_bytes", 0) or 0),
+            "ple_staging_bytes": int(ple.get("staging_budget_bytes", 0) or 0),
+            "ple_pageable_ram_bytes": int(ple.get("pageable_ram_bytes", 0) or 0),
+            "ple_pinned_staging_bytes": int(ple.get("pinned_staging_bytes", 0) or 0),
+            "ple_cache_policy": ple.get("cache_policy"),
+            "ple_batched_cache": bool(ple.get("batched_cache", False)),
+            "ple_fused_dequant": bool(ple.get("fused_dequant", False)),
+            "ple_counters": {k: max(int(ple.get(k, 0) or 0), int(live_ple.get(k, 0) or 0)) for k in (
+                "forward_calls", "lookup_calls", "lookup_rows", "ram_page_hits",
+                "ram_page_misses", "ram_page_evictions", "gpu_hits", "gpu_misses",
+                "gpu_evictions", "ssd_read_ops", "ssd_read_bytes", "requested_packed_bytes",
+                "prefetch_requests", "prefetch_hits", "prefetch_late", "d2h_id_bytes",
+                "prefetch_demand_hits", "prefetch_pages_evicted", "prefetch_queue_saturation",
+                "prefetch_pages_submitted", "prefetch_pages_skipped", "prefetch_failures",
+                "row_cache_hits", "row_cache_misses", "row_cache_evictions",
+                "h2d_row_bytes", "io_wait_us", "lookup_wait_us",
+                "prefetch_plan_us", "prefetch_d2h_us", "io_queue_wait_us", "ram_gather_us",
+                "h2d_submit_us", "io_failed_ops", "io_queue_starvation",
+                "planned_rows", "planned_unique_rows", "planned_pages",
+                "gpu_batched_rows", "gpu_batch_ops", "gpu_reconstruct_ops",
+                "fused_dequant_calls", "fused_dequant_fallbacks",
+                "qsa_forward_calls", "qsa_prefill_calls", "qsa_live_columns",
+                "qsa_allocated_columns", "qsa_score_submit_us", "qsa_topk_submit_us",
+                "qsa_attend_submit_us",
+                "gpu_cache_hits", "gpu_cache_misses", "gpu_cache_evictions",
+                "prefetch_calls", "pages_read", "cache_hits", "cache_misses", "waits",
+            ) if k in ple or k in live_ple},
+        })
+    # Promote expert source metadata alongside PLE geometry. Nested ``storage``
+    # remains canonical/backward-compatible; promoted fields let lightweight
+    # clients display host residency without parsing model-specific objects.
+    storage = geo.get("storage") or {}
+    experts = storage.get("expert_banks") if isinstance(storage, dict) else None
+    if isinstance(experts, dict):
+        geo.update({
+            "expert_source_policy": experts.get("source_policy"),
+            "expert_destination": experts.get("destination"),
+            "expert_host_bytes": int(experts.get("host_bytes", 0) or 0),
+            "expert_headroom_bytes": int(experts.get("headroom_bytes", 0) or 0),
+            "expert_fingerprint": experts.get("fingerprint"),
+        })
+    host_tier = geo.get("qwen38_host_tier")
+    if isinstance(host_tier, dict):
+        geo["qwen38_host_cache"] = {
+            key: host_tier.get(key)
+            for key in ("shared_bytes", "expert_bytes", "ple_page_bytes", "ple_row_bytes", "staging_bytes", "degraded")
+        }
+    live = getattr(state.stats, "status_snapshot", lambda: {})()
+    geo["live_status"] = live
+    geo["ple_probe"] = getattr(state, "ple_probe", None)
+    geo["ple_probe_timeout_s"] = getattr(state, "ple_probe_timeout_s", None)
     # Per-pool slider bounds, sized against the cache budget the rebuild fit-check actually
     # enforces — NOT the raw post-weights free VRAM, which is larger by the (1-memory_ratio)
     # graph/activation headroom and would offer slider room every rebuild rejects. Both come
@@ -827,7 +948,20 @@ async def generate(req: GenerateRequest, request: Request):
         return JSONResponse({"error": f"server unavailable: {detail}"}, status_code=503)
     if req.max_tokens < 1:
         return JSONResponse({"error": f"max_tokens must be at least 1, got {req.max_tokens}"}, status_code=400)
-    uid = state.new_user()
+    try:
+        uid = state.new_user()
+    except AdmissionBusyError as exc:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": str(exc),
+                    "type": "rate_limit_error",
+                    "code": "server_busy",
+                }
+            },
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
     await state.send_one(
         TokenizeMsg(
             uid=uid,
@@ -1012,6 +1146,9 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
         _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
         _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
         _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)
+        _GLOBAL_STATE.storage_report = meta.pop("storage", None)
+        _GLOBAL_STATE.ple_probe = meta.pop("ple_probe", None)
+        _GLOBAL_STATE.ple_probe_timeout_s = float(meta.pop("ple_probe_timeout_s", getattr(config, "ple_probe_timeout_s", 300.0)) or 300.0)
         _GLOBAL_STATE.gpus = list(meta.pop("gpus", None) or [])
         _GLOBAL_STATE.unit_bytes = meta
 
@@ -1028,6 +1165,7 @@ def run_api_server(config: ServerArgs, start_backend: Callable[[], "Any"], run_s
             # uvicorn's lifespan shutdown sets this on SIGINT/SIGTERM, so the workers'
             # expected exit during stop is not reported as a crash.
             "is_shutting_down": _SHUTTING_DOWN.is_set,
+            "startup_probe_timeout_s": float(getattr(config, "ple_probe_timeout_s", 300.0)),
         },
         name="freetoken-backend-supervisor",
         daemon=True,

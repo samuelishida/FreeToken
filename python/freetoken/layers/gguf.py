@@ -14,14 +14,21 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 from __future__ import annotations
 
 import torch
+import os
+from freetoken.utils import init_logger
 
 from freetoken.models.gguf.dequant import (
     BLOCK_SHAPE,
     GGML_BF16,
     GGML_F16,
     GGML_F32,
+    GGML_IQ2_XS,
+    GGML_IQ3_XXS,
+    GGML_IQ4_NL,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -29,15 +36,24 @@ from freetoken.models.gguf.dequant import (
 
 from .base import BaseOP
 
+logger = init_logger(__name__)
+
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {
+    GGML_Q4_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0,
+    GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ4_NL,
+}
+_MMQ = {GGML_Q4_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0}
 _DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_VECTOR_ONLY = {GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ4_NL}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
+_TRITON_DECODE_LOGGED: set[int] = set()
+_TRITON_DECODE_FAILURE_LOGGED: set[int] = set()
+_GGUF_CALL_LOGGED: set[int] = set()
 
 
 def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int) -> torch.Tensor:
@@ -49,11 +65,54 @@ def fused_mul_mat_gguf(x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
     )
 
     out_features = qweight.shape[0]
+    if int(qweight_type) not in _GGUF_CALL_LOGGED:
+        logger.info(
+            "GGUF linear decode call: type=%s rows=%s width=%s device=%s dtype=%s",
+            int(qweight_type), int(out_features), int(x.shape[1]), x.device, x.dtype,
+        )
+        _GGUF_CALL_LOGGED.add(int(qweight_type))
     if x.shape[0] == 0:
         return x.new_empty((0, out_features))
     if qweight_type in _UNQUANTIZED:
         return x @ qweight.T
-    if x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ:
+    # ROCm gfx1100's vendored GGUF MMVQ path can stall on standard K-quants.
+    # Decode one token through the bounded Triton packed GEMV instead. This
+    # keeps weights packed, avoids multi-gigabyte dequant buffers, and falls
+    # through to the known-correct Torch decoder when Triton is unavailable.
+    if (
+        torch.version.hip is not None
+        and x.shape[0] == 1
+        and qweight_type in (GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K)
+        and os.environ.get("FREETOKEN_DISABLE_GGUF_TRITON_DECODE", "").strip().lower()
+        not in ("1", "true", "yes", "on")
+    ):
+        try:
+            from freetoken.kernel.triton.qwen4exp_quant import fused_gguf_decode_standard
+            output = fused_gguf_decode_standard(
+                x,
+                qweight,
+                ggml_type=int(qweight_type),
+                out_features=int(out_features),
+            )
+            if int(qweight_type) not in _TRITON_DECODE_LOGGED:
+                logger.info(
+                    "GGUF Triton standard GEMV active: type=%s rows=%s width=%s",
+                    int(qweight_type), int(out_features), int(x.shape[1]),
+                )
+                _TRITON_DECODE_LOGGED.add(int(qweight_type))
+            return output
+        except Exception as exc:
+            # Optional optimization. Existing dispatch below remains parity
+            # fallback; qwen38 script forces safe Torch fallback on ROCm.
+            if int(qweight_type) not in _TRITON_DECODE_FAILURE_LOGGED:
+                logger.warning(
+                    "GGUF Triton standard GEMV unavailable: type=%s rows=%s width=%s: %s",
+                    int(qweight_type), int(out_features), int(x.shape[1]), exc,
+                )
+                _TRITON_DECODE_FAILURE_LOGGED.add(int(qweight_type))
+            pass
+    # IQ formats have vendored MMVQ kernels but no MMQ kernels.
+    if qweight_type in _VECTOR_ONLY or (x.shape[0] <= _MMVQ_SAFE and qweight_type in _MMVQ):
         return ggml_mul_mat_vec_a8(qweight, x, qweight_type, out_features)
     if qweight_type in _MMQ:
         return ggml_mul_mat_a8(qweight, x, qweight_type, out_features)

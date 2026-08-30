@@ -99,10 +99,13 @@ def _tile_ranks(key, prefix, ties, above_base, equal_base):
     equal = ((key == prefix) & (key != 0)).to(tl.int32)
     packed = greater | (equal << 16)
     before = tl.cumsum(packed, axis=0) - packed
-    rank_equal = equal_base + (before >> 16)
-    take = (greater == 1) | ((equal == 1) & (rank_equal < ties))
-    rank = above_base + (before & 0xFFFF) + tl.minimum(rank_equal, ties)
+    equal_before = equal_base + (before >> 16)
     total = tl.sum(packed)
+    # Selection is score-based, but output order is column order.  Rank selected entries by
+    # their prefix count; score ordering here would make expansion depend on tie ordering.
+    take = (greater == 1) | ((equal == 1) & (equal_before < ties))
+    selected_before = tl.cumsum(take.to(tl.int32), axis=0) - take.to(tl.int32)
+    rank = above_base + tl.minimum(equal_base, ties) + selected_before
     return rank, take, above_base + (total & 0xFFFF), equal_base + (total >> 16)
 
 
@@ -373,6 +376,7 @@ def qsa_block_topk(
     top_k = out.shape[1]
     if not rows or not top_k:
         return out
+
     pad_k = triton.next_power_of_2(top_k)
     plan = _split_plan(columns, top_k)
     if plan is None:

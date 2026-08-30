@@ -23,6 +23,18 @@ class AdmissionClosedError(RuntimeError):
     """A generation tried to enter after the prepare-stop gate was closed."""
 
 
+class AdmissionBusyError(RuntimeError):
+    """The frontend request budget is full; retry after active work drains."""
+
+    def __init__(self, active: int, limit: int) -> None:
+        self.active = int(active)
+        self.limit = int(limit)
+        super().__init__(
+            f"server busy: {self.active} request(s) active; "
+            f"max-running-requests={self.limit}"
+        )
+
+
 class AccountingDrainError(RuntimeError):
     """The engine could not reach a sealed accounting state within the bounded stop barrier."""
 
@@ -135,6 +147,21 @@ def register_accounting_routes(app: FastAPI, get_state: Callable[[], Any]) -> No
         return JSONResponse(status_code=503, content={"error": str(exc)})
 
     app.add_exception_handler(AdmissionClosedError, _admission_closed)
+
+    async def _admission_busy(_: Request, exc: AdmissionBusyError) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "1"},
+            content={
+                "error": {
+                    "message": str(exc),
+                    "type": "rate_limit_error",
+                    "code": "server_busy",
+                }
+            },
+        )
+
+    app.add_exception_handler(AdmissionBusyError, _admission_busy)
 
     @app.post("/v1/admin/prepare-stop")
     async def prepare_stop(request: Request, body: PrepareStopBody | None = None):

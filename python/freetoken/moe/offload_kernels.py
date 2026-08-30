@@ -90,6 +90,83 @@ def reset_cache(cache) -> None:
     _reset_cache_gpu(cache)
 
 
+@triton.jit
+def _scatter_pageable_qwen4_rows_kernel(
+    gate_src_ptr,
+    up_src_ptr,
+    down_src_ptr,
+    gate_dst_ptr,
+    up_dst_ptr,
+    down_dst_ptr,
+    dst_ids_ptr,
+    count,
+    gate_width: tl.constexpr,
+    up_width: tl.constexpr,
+    down_width: tl.constexpr,
+    gate_groups: tl.constexpr,
+    up_groups: tl.constexpr,
+    down_groups: tl.constexpr,
+    gate_tail: tl.constexpr,
+    up_tail: tl.constexpr,
+    down_tail: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Scatter three selected packed Qwen4 rows in one launch.
+
+    Sources are already on device; the mmap->CPU->GPU transfer happens before this
+    kernel. Keeping all three banks in one launch removes two tiny ROCm dispatches
+    per MoE layer while preserving each bank's native variable row width.
+    """
+    row = tl.program_id(0)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    dst = tl.load(dst_ids_ptr + row).to(tl.int64)
+    gate_mask = (row < count) & (col < gate_groups * gate_width)
+    up_mask = (row < count) & (col < up_groups * up_width)
+    down_mask = (row < count) & (col < down_groups * down_width)
+    gate_group = col // gate_width
+    gate_inner = col - gate_group * gate_width
+    up_group = col // up_width
+    up_inner = col - up_group * up_width
+    down_group = col // down_width
+    down_inner = col - down_group * down_width
+    tl.store(gate_dst_ptr + dst * gate_groups * gate_tail + gate_group * gate_tail + gate_inner,
+             tl.load(gate_src_ptr + row * gate_groups * gate_width + col, mask=gate_mask, other=0),
+             mask=gate_mask)
+    tl.store(up_dst_ptr + dst * up_groups * up_tail + up_group * up_tail + up_inner,
+             tl.load(up_src_ptr + row * up_groups * up_width + col, mask=up_mask, other=0),
+             mask=up_mask)
+    tl.store(down_dst_ptr + dst * down_groups * down_tail + down_group * down_tail + down_inner,
+             tl.load(down_src_ptr + row * down_groups * down_width + col, mask=down_mask, other=0),
+             mask=down_mask)
+
+
+def scatter_pageable_qwen4_rows(
+    sources: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    destinations: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    dst_ids: torch.Tensor,
+) -> None:
+    """Copy selected Qwen4 packed rows from GPU staging into cache slots."""
+    widths = tuple(int(t[0].numel()) if t.ndim else 0 for t in destinations)
+    inner_widths = tuple(int(t.shape[-1]) if t.ndim else 0 for t in destinations)
+    groups = tuple(int(t[0].numel() // t.shape[-1]) if t.ndim else 0 for t in destinations)
+    # Qwen4 cache rows reserve max(last_dim) bytes/elements. A narrow view is
+    # non-contiguous; pass its physical tail stride instead of forcing reshape()
+    # to allocate a full cache-sized temporary.
+    tails = tuple(int(t.stride(-2)) if t.ndim >= 2 else 0 for t in destinations)
+    if not dst_ids.numel():
+        return
+    block = 256
+    max_width = max(widths)
+    _scatter_pageable_qwen4_rows_kernel[(dst_ids.numel(), triton.cdiv(max_width, block))](
+        *sources,
+        *destinations,
+        dst_ids,
+        dst_ids.numel(),
+        gate_width=inner_widths[0], up_width=inner_widths[1], down_width=inner_widths[2],
+        gate_groups=groups[0], up_groups=groups[1], down_groups=groups[2],
+        gate_tail=tails[0], up_tail=tails[1], down_tail=tails[2], BLOCK=block,
+        num_warps=1,
+    )
 
 
 

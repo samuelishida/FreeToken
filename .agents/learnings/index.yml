@@ -13,3 +13,12 @@ tinygrad-rangeify:
 tinygrad-moe-capture-nan:
   file: tinygrad-moe-capture-nan.md
   description: O fused expert-decode GEMM corrompe grafos TinyJit >=16K (NaN logits, crash do server); MoE genérico é o comprovado. Bench greedy não pega NaN - validar conteúdo com scripts/probe-decode-nan.py.
+qwen38-engram-ssd:
+  file: qwen38-engram-ssd.md
+  description: Qwen4-Exp GGUF work: preserve raw QSA/PLE state, split multi-block quant rows, use standard ROCm Engine with Q8 QSA KV, bounded lock-free PLE I/O, and distinguish warm throughput from cold HIP compilation.
+qwen38-ssd-residency-implementation:
+  file: qwen38-ssd-residency-implementation.md
+  description: Qwen3.8 SSD PLE implementation decisions: bounded sidecar paging, expert residency preflight, grouped ROCm MoE, scheduler fairness, and restart requirements for live validation.
+qwen38-grouped-moe-oom:
+  file: qwen38-grouped-moe-oom.md
+  description: Avoid Qwen3.8 grouped MoE route-weight replication: shared per-group GEMMs keep prefill workspace bounded on 24 GiB ROCm cards.

@@ -59,6 +59,18 @@ class UserReply(BaseFrontendMsg):
 
 
 @dataclass
+class StatusReply(BaseFrontendMsg):
+    """Live scheduler/PLE status event; never enters request ack queues."""
+
+    uid: int
+    stage: str
+    seq: int
+    timestamp: float
+    ple: Dict[str, int] | None = None
+    error: str | None = None
+
+
+@dataclass
 class CacheRebuildReply(BaseFrontendMsg):
     # detokenizer worker -> api server: result of a /v1/cache/rebuild request.
     request_id: str

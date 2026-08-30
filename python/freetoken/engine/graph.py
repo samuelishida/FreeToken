@@ -138,7 +138,10 @@ class GraphRunner:
         from freetoken.utils.arch import is_rocm
         from freetoken.utils.graph_gate import graph_capture_status
 
-        if is_rocm() and graph_capture_status() == "fail":
+        # A CPU/deviceless GraphRunner is used by deterministic unit fixtures and
+        # must not inherit process-wide HIP gating. Only real CUDA/HIP execution
+        # should consult device capture capability.
+        if self.device.type == "cuda" and is_rocm() and graph_capture_status() == "fail":
             logger.info_rank0(
                 "AMD ROCm build: HIP graph capture gate FAILED on this device; "
                 "using the kernel-launch decode path (CUDA graphs disabled)."

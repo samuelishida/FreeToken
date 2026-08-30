@@ -18,6 +18,7 @@ back into their assistant turn as ``reasoning_content``.
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -63,8 +64,10 @@ from .generation import (
     ContentDelta,
     GenDone,
     GenerationError,
+    GenerationTimeout,
     GenResult,
     GenSpec,
+    RequestDeadline,
     ReasoningDelta,
     ToolCallArgsDelta,
     ToolCallsDelta,
@@ -77,12 +80,47 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .accounting import AdmissionBusyError
 from .request_logger import log_request
 
 # Seconds of event silence before a keep-alive frame is emitted on the stream.
 # codex's stream-idle timeout (default 300s) only resets on a data-bearing SSE
 # frame, so long queue/prefill or decode gaps must be bridged with real events.
 KEEPALIVE_INTERVAL_S = 15.0
+
+
+def _heartbeat_interval(state: Any) -> float:
+    value = getattr(getattr(state, "config", None), "sse_heartbeat_s", KEEPALIVE_INTERVAL_S)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("sse_heartbeat_s must be a positive finite number") from None
+    if value <= 0 or not math.isfinite(value):
+        raise ValueError("sse_heartbeat_s must be a positive finite number")
+    return value
+
+
+async def _abort_once(state: Any, uid: int | None, timeout: GenerationTimeout | None = None) -> None:
+    if uid is None or (timeout is not None and timeout.aborted):
+        return
+    abort = getattr(state, "abort_user", None)
+    if abort is not None:
+        await abort(uid)
+        if timeout is not None:
+            timeout.aborted = True
+
+
+async def _deadline_events(events: AsyncIterator[Any], state: Any, uid: int, deadline: RequestDeadline):
+    """Apply one total request deadline while preserving downstream keepalives."""
+    iterator = events.__aiter__()
+    while True:
+        try:
+            yield await deadline.wait(iterator.__anext__(), "generation")
+        except StopAsyncIteration:
+            return
+        except GenerationTimeout as exc:
+            await _abort_once(state, uid, exc)
+            raise
 
 class ResponsesRequest(BaseModel):
     """The subset of the Responses request FreeToken honors (extra fields allowed)."""
@@ -146,6 +184,7 @@ async def handle_responses(
     state: Any,
     model_sampling: dict[str, Any],
 ):
+    deadline = RequestDeadline.start(state)
     response_id = f"resp_{uuid.uuid4().hex}"
     created = int(time.time())
     if req.max_output_tokens is not None and req.max_output_tokens < 1:
@@ -156,22 +195,35 @@ async def handle_responses(
             req, model_sampling, default_max_tokens=default_max,
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
-        uid = await submit_generation(spec, state)
+        uid = await submit_generation(spec, state, deadline=deadline)
+    except AdmissionBusyError as exc:
+        return _error_response(429, str(exc), "server_busy")
+    except GenerationTimeout as exc:
+        await _abort_once(state, exc.uid, exc)
+        return _error_response(504, str(exc), exc.code)
     except ValueError as exc:
         return _error_response(400, str(exc))
 
     cache_report = getattr(state.config, "enable_cache_report", False)
     if req.stream:
         events = responses_stream_generator(
-            generate_events(uid, spec, state, source="/v1/responses"), req, response_id, created,
-            cache_report=cache_report,
+            _deadline_events(
+                generate_events(uid, spec, state, source="/v1/responses"), state, uid, deadline
+            ),
+            req, response_id, created, cache_report=cache_report,
+            heartbeat_s=_heartbeat_interval(state),
         )
         if request is not None:
             events = state.stream_with_cancellation(events, request, uid)
         return StreamingResponse(events, media_type="text/event-stream")
 
     try:
-        result = await generate_full(uid, spec, state, source="/v1/responses")
+        result = await deadline.wait(
+            generate_full(uid, spec, state, source="/v1/responses"), "generation"
+        )
+    except GenerationTimeout as exc:
+        await _abort_once(state, uid, exc)
+        return _error_response(504, str(exc), exc.code)
     except GenerationError as exc:
         return _error_response(400, str(exc), exc.code)
     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)
@@ -473,6 +525,7 @@ async def responses_stream_generator(
     response_id: str,
     created: int,
     cache_report: bool = False,
+    heartbeat_s: float = KEEPALIVE_INTERVAL_S,
 ) -> AsyncIterator[str]:
     seq = _Seq()
 
@@ -576,7 +629,7 @@ async def responses_stream_generator(
             item_id=current["id"], output_index=output_index, delta=fragment,
         ))
 
-    events = with_keepalive(events, KEEPALIVE_INTERVAL_S)
+    events = with_keepalive(events, heartbeat_s)
     try:
         async for ev in events:
             if ev is KEEPALIVE:

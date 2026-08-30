@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, List
@@ -13,6 +14,12 @@ if TYPE_CHECKING:
     from freetoken.models import ModelConfig
 
 
+# One finite default shared by CLI, direct EngineConfig users, request deadlines,
+# and startup metadata.  A timeout is a safety bound, never an admission or
+# performance mechanism.
+DEFAULT_REQUEST_TIMEOUT_S = 3600.0
+
+
 @dataclass(frozen=True)
 class EngineConfig:
     model_path: str
@@ -22,6 +29,10 @@ class EngineConfig:
     # tinygrad fork's direct kfd/hsa backend).
     device: str = "cuda"
     max_running_req: int = 4
+    # Requests beyond max_running_req are held by the frontend only.  Zero is
+    # the compatibility sentinel: serial engines retain their historical
+    # bounded 4 * max_running_req admission budget.
+    max_pending_requests: int = 0
     attention_backend: str = "auto"
     moe_backend: str = "auto"
     # NVFP4 routed-expert GEMM backend (--nvfp4-backend): auto|marlin|flashinfer|triton.
@@ -35,6 +46,11 @@ class EngineConfig:
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
+    # Independent KV storage dtype. ``auto`` follows compute dtype; ``q8`` is currently
+    # supported by QSA only and keeps QSA index slabs in the 16-bit compute dtype.
+    kv_cache_dtype: str = "auto"
+    # Optional lower KV floor retried when the primary auto-cache floor cannot fit.
+    kv_reserve_fallback_tokens: int | None = None
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
@@ -83,6 +99,110 @@ class EngineConfig:
     # KV capacity in tokens; resolved into num_page_override by _adjust_config once page_size
     # is final. Mutually exclusive with num_page_override.
     num_token_override: int | None = None
+    ple_store: str | None = None
+    ple_store_build: str = "auto"
+    ple_ram_cache_mib: int | str = 512
+    # Packed IQ4_NL hot rows are separate from 4 KiB page cache.  ``0`` keeps
+    # direct EngineConfig callers on legacy page-only behavior; ROCm launcher
+    # opts into ``auto``.
+    ple_row_cache_mib: int | str = 0
+    qwen38_host_cache_mib: int | str = 0
+    qwen38_expert_host_cache_mib: int | str = 0
+    ple_gpu_cache_mib: int = 128
+    ple_staging_mib: int = 32
+    ple_io: str = "auto"
+    ple_io_depth: int | str = 64
+    # Deprecated tinygrad-only knobs retained for config compatibility.
+    ple_ram_gib: float = 0.0
+    ple_workers: int = 2
+    ple_prefetch: bool = True
+    ple_mode: str = "auto"
+    ple_cache_policy: str = "lru"
+    ple_prefetch_depth: int | str = 64
+    # Packed GPU-row cache is production default whenever a non-zero GPU budget exists.
+    # BooleanOptionalAction still exposes --no-ple-batched-cache for rollback/debugging.
+    # CLI/script enables this for Qwen ROCm; false remains a supported rollback
+    # for generic callers and legacy tests.
+    ple_batched_cache: bool = False
+    ple_fused_dequant: bool = False
+    qwen38_qsa_prefill_live_width: bool = False
+    # Qwen3.8 GGUF grouped routed-expert execution. The grouped path is the
+    # production default; disabling it selects the bounded batched-Torch path,
+    # never the primitive per-expert oracle.
+    qwen38_moe_grouped: bool = True
+    # Selected packed-row scratch budget. It is charged against the MoE cache
+    # budget by engine setup and never permits full-bank dequantization.
+    qwen38_moe_scratch_mib: int = 128
+    qwen38_prefill_adaptive: bool = False
+    # Qwen3.8 GGUF routed expert host source. ``ram`` is production default:
+    # packed anonymous CPU RAM; ``mmap`` is explicit compatibility mode;
+    # ``auto`` selects ram only when metadata preflight confirms headroom.
+    qwen38_expert_residency: str = "ram"
+    # Total wall-clock budget for one OpenAI generation, including rendering, admission,
+    # prefill/decode, and final response assembly. Finite by design: zero never means infinite.
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    # SSE keepalive interval during long prefill/PLE reads. Must remain below request timeout.
+    sse_heartbeat_s: float = 15.0
+    # Parent-side deadline for GPU/PLE startup probe. Kept separate from request watchdog.
+    ple_probe_timeout_s: float = 300.0
+
+    def __post_init__(self) -> None:
+        """Fail before model allocation, including direct programmatic construction."""
+        try:
+            timeout = float(self.request_timeout_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("request_timeout_s must be a positive finite number") from exc
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("request_timeout_s must be a positive finite number")
+        try:
+            heartbeat = float(self.sse_heartbeat_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("sse_heartbeat_s must be a positive finite number") from exc
+        if heartbeat <= 0 or not math.isfinite(heartbeat):
+            raise ValueError("sse_heartbeat_s must be a positive finite number")
+        if heartbeat >= timeout:
+            raise ValueError("sse_heartbeat_s must be shorter than request_timeout_s")
+        try:
+            pending = int(self.max_pending_requests)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_pending_requests must be a non-negative integer") from exc
+        if pending < 0 or pending != self.max_pending_requests:
+            raise ValueError("max_pending_requests must be a non-negative integer")
+        if self.qwen38_expert_residency not in ("ram", "mmap", "auto", "auto-tier"):
+            raise ValueError(
+                "qwen38_expert_residency must be one of: ram, mmap, auto, auto-tier"
+            )
+        from freetoken.engine.host_tier import parse_budget
+
+        for name in (
+            "ple_ram_cache_mib", "ple_row_cache_mib", "qwen38_host_cache_mib",
+            "qwen38_expert_host_cache_mib",
+        ):
+            try:
+                parse_budget(getattr(self, name), name=name)
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+        for name, minimum in (("ple_io_depth", 1), ("ple_prefetch_depth", 0)):
+            value = getattr(self, name)
+            if isinstance(value, str) and value in ("auto", "adaptive"):
+                continue
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be auto or an integer in [0, 256]") from exc
+            if parsed < minimum or parsed > 256 or parsed != value:
+                bound = f"{minimum}, 256"
+                raise ValueError(f"{name} must be an integer in [{bound}]")
+        if not isinstance(self.qwen38_moe_grouped, bool):
+            raise ValueError("qwen38_moe_grouped must be a boolean")
+        if not isinstance(self.qwen38_prefill_adaptive, bool):
+            raise ValueError("qwen38_prefill_adaptive must be a boolean")
+        try:
+            scratch_mib = int(self.qwen38_moe_scratch_mib)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("qwen38_moe_scratch_mib must be a positive integer") from exc
+        if scratch_mib <= 0 or scratch_mib != self.qwen38_moe_scratch_mib:
+            raise ValueError("qwen38_moe_scratch_mib must be a positive integer")
 
     @cached_property
     def hf_config(self):

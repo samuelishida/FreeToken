@@ -1,3 +1,5 @@
+import importlib
+
 from .index import indexing
 from .fast_index_copy import fast_index_copy_jit, update_copy_flag_jit
 from .moe_impl import (
@@ -38,3 +40,17 @@ __all__ = [
     "create_pinned_tensor_like",
     "copy_to_pinned_tensor",
 ]
+
+# Backend-probe tests may swap the parent ``freetoken`` module while leaving a
+# previously imported ``freetoken.kernel.gguf`` in ``sys.modules``. Restore the
+# child attribute lazily for package-qualified callers without importing GGUF
+# extension code during ordinary kernel package startup.
+_LAZY_SUBMODULES = frozenset({"backend", "gguf", "triton"})
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SUBMODULES:
+        module = importlib.import_module(f"{__name__}.{name}")
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

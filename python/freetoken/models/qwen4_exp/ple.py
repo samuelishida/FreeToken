@@ -65,7 +65,7 @@ class PLETableBackend(Protocol):
 
     def lookup(self, row_ids: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor: ...
 
-    def prefetch(self, row_ids: torch.Tensor) -> None: ...
+    def prefetch(self, row_ids: torch.Tensor, *, is_decode: bool = False) -> None: ...
 
 
 class GpuResidentTable:
@@ -91,7 +91,7 @@ class GpuResidentTable:
         out.copy_(rows)
         return out
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(self, row_ids: torch.Tensor, *, is_decode: bool = False) -> None:
         return None
 
 
@@ -112,7 +112,7 @@ class ZeroTable:
             device=row_ids.device,
         )
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(self, row_ids: torch.Tensor, *, is_decode: bool = False) -> None:
         return None
 
 
@@ -170,6 +170,23 @@ class PinnedUVATable:
         return buf[:rows]
 
     def _gather(self, row_ids: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+        # HIP gfx1100 cannot safely dereference the translated host pointer from
+        # this Triton kernel (some driver/compiler combinations hard-crash).
+        # Keep legacy safetensors PLE usable with a bounded CPU gather; production
+        # GGUF serving uses PackedPagedPLETable and never enters this path.
+        if torch.version.hip is not None:
+            host_ids = row_ids.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+            valid = (host_ids >= 0) & (host_ids < self.num_rows)
+            safe_ids = host_ids.clamp(0, max(0, self.num_rows - 1))
+            values = self.weight.index_select(0, safe_ids).to(dtype=self.dtype)
+            # PLE checkpoint scale is per tensor, independent of storage dtype.
+            # The Triton path applies it for both FP8 and BF16; keep the HIP
+            # pageable fallback numerically identical to the resident oracle.
+            if self.scale != 1.0:
+                values = values * self.scale
+            values[~valid] = 0
+            dst.copy_(values.to(device=dst.device), non_blocking=False)
+            return dst
         from freetoken.kernel.triton.ple import ple_gather_rows
 
         return ple_gather_rows(
@@ -182,7 +199,7 @@ class PinnedUVATable:
             self._is_fp8,
         )
 
-    def prefetch(self, row_ids: torch.Tensor) -> None:
+    def prefetch(self, row_ids: torch.Tensor, *, is_decode: bool = False) -> None:
         if self._stream is None or row_ids.numel() == 0:
             return
         dst = self._stage(row_ids.numel())
@@ -293,6 +310,10 @@ class PLEMetadata:
     state_slots: torch.Tensor
     fresh_slots: torch.Tensor | None
     is_decode: bool
+    # Optional scheduler-owned identity.  A row-id cache is valid only while
+    # both values and input/context storage are immutable for this version.
+    context_version: int | None = None
+    cache_handle: object | None = None
 
 
 def _state_slot(req) -> int:
@@ -345,6 +366,8 @@ def build_ple_metadata(
             state_slots=slots,
             fresh_slots=None,
             is_decode=True,
+            context_version=getattr(batch, "ple_context_version", None),
+            cache_handle=getattr(batch, "ple_cache_handle", None),
         )
 
     lens = [r.extend_len for r in reqs]
@@ -367,6 +390,8 @@ def build_ple_metadata(
         state_slots=slots,
         fresh_slots=fresh,
         is_decode=batch.is_decode,
+        context_version=getattr(batch, "ple_context_version", None),
+        cache_handle=getattr(batch, "ple_cache_handle", None),
     )
 
 
@@ -416,9 +441,16 @@ class NGramEmbedding(BaseOP):
         self.ngram_heads_vocab_sizes = torch.empty(self.num_heads, dtype=torch.int64)
         self.ngram_heads_offsets = torch.empty(self.num_heads, dtype=torch.int64)
         self._table = table
+        self._row_cache_key = None
+        self._row_cache_value: torch.Tensor | None = None
 
     def attach_table(self, table: PLETableBackend) -> None:
         self._table = table
+
+    def clear_cache(self) -> None:
+        """Drop scheduler-versioned row IDs after abort/COW/context reset."""
+        self._row_cache_key = None
+        self._row_cache_value = None
 
     @property
     def table(self) -> PLETableBackend:
@@ -464,6 +496,18 @@ class NGramEmbedding(BaseOP):
 
     def row_ids(self, meta: PLEMetadata) -> torch.Tensor:
         """Global table row per (token, hash head): ``[T, num_ngram_heads]`` int64."""
+        # Never infer validity from tensor object identity alone: scheduler may
+        # reuse storage after COW.  Explicit handle+version is the ownership
+        # contract for immutable chunk metadata; storage identities prevent a
+        # different chunk accidentally matching the same version number.
+        cache_key = None
+        if meta.cache_handle is not None and meta.context_version is not None:
+            cache_key = (
+                id(meta.cache_handle), int(meta.context_version), id(meta.input_ids),
+                id(meta.ngram_context), id(meta.state_slots), meta.is_decode,
+            )
+            if cache_key == self._row_cache_key and self._row_cache_value is not None:
+                return self._row_cache_value
         packed, select = self._window(meta)
         tokens = [select(s) for s in self._shift_ignore_eos(packed)]
         blocks = []
@@ -475,7 +519,11 @@ class NGramEmbedding(BaseOP):
                 mixed = torch.bitwise_xor(mixed, tokens[position] * self.layer_multipliers[position])
             head_ids = torch.remainder(mixed.unsqueeze(-1), self.ngram_heads_vocab_sizes[start:end])
             blocks.append(head_ids + self.ngram_heads_offsets[start:end])
-        return torch.cat(blocks, dim=-1)
+        result = torch.cat(blocks, dim=-1)
+        if cache_key is not None:
+            self._row_cache_key = cache_key
+            self._row_cache_value = result
+        return result
 
     def forward(self, meta: PLEMetadata, out: torch.Tensor | None = None) -> torch.Tensor:
         return self.table.lookup(self.row_ids(meta), out)
@@ -574,7 +622,7 @@ class PLELayer(BaseOP):
             meta = build_ple_metadata(batch, self.args, batch.input_ids.device)
         row_ids = self.ple_embedding.row_ids(meta)
         self._pending = (meta, row_ids)
-        self.ple_embedding.table.prefetch(row_ids)
+        self.ple_embedding.table.prefetch(row_ids, is_decode=meta.is_decode)
 
     def forward(
         self,
@@ -596,16 +644,58 @@ class PLELayer(BaseOP):
             row_ids = self.ple_embedding.row_ids(meta)
 
         embeddings = self.ple_embedding.table.lookup(row_ids).to(R.dtype)
-        key = self.norm_key.forward(self.key_proj.forward(embeddings))
-        value = self.value_proj.forward(embeddings)
-        query = self.norm_query.forward(R)
-        shape = (-1, self.hc_count, self.hidden_size)
-        gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
-        gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
-        gated = (gate * value.unsqueeze(-2)).flatten(-2)
-        states = conv_states if conv_states is not None else self._conv_state_slab(R)
-        x = self.norm_conv.forward(gated)
         fla = getattr(batch, "fla_metadata", None)
+        tracking = fla is not None and fla.track_boundary_row is not None
+        if tracking:
+            # Keep row-wise kernels on request-local, fixed-size chunks.  This
+            # makes donated snapshots bit-identical to a forward stopped at
+            # their boundary even when BLAS selects shape-dependent kernels.
+            from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+            ranges = []
+            offset = 0
+            for n in meta.seq_lens:
+                ranges.extend(
+                    (offset + start, offset + min(start + CHUNK_SIZE, n))
+                    for start in range(0, n, CHUNK_SIZE)
+                )
+                offset += n
+
+            def fixed_apply(fn, tensor):
+                return torch.cat([fn(tensor[start:end]) for start, end in ranges], dim=0)
+
+            key = fixed_apply(lambda t: self.norm_key.forward(self.key_proj.forward(t)), embeddings)
+            value = fixed_apply(self.value_proj.forward, embeddings)
+            query = fixed_apply(self.norm_query.forward, R)
+            shape = (-1, self.hc_count, self.hidden_size)
+            gate_parts = []
+            value_parts = []
+            for start, end in ranges:
+                gate_part = (key[start:end].view(shape) * query[start:end].view(shape)).sum(
+                    -1, keepdim=True
+                ) / math.sqrt(self.hidden_size)
+                gate_parts.append(torch.sigmoid(gate_part.sign() * gate_part.abs().clamp_min(1e-6).sqrt()))
+                value_parts.append(value[start:end])
+            gated = torch.cat(
+                [
+                    (gate * val.unsqueeze(-2)).flatten(-2)
+                    for gate, val in zip(gate_parts, value_parts)
+                ],
+                dim=0,
+            )
+        else:
+            key = self.norm_key.forward(self.key_proj.forward(embeddings))
+            value = self.value_proj.forward(embeddings)
+            query = self.norm_query.forward(R)
+            shape = (-1, self.hc_count, self.hidden_size)
+            gate = (key.view(shape) * query.view(shape)).sum(-1, keepdim=True) / math.sqrt(self.hidden_size)
+            gate = torch.sigmoid(gate.sign() * gate.abs().clamp_min(1e-6).sqrt())
+            gated = (gate * value.unsqueeze(-2)).flatten(-2)
+        states = conv_states if conv_states is not None else self._conv_state_slab(R)
+        if tracking:
+            x = fixed_apply(self.norm_conv.forward, gated)
+        else:
+            x = self.norm_conv.forward(gated)
         if fla is not None and fla.track_boundary_row is not None:
             self._write_track_snapshot(states, x, fla)
         return gated + self._short_conv(x, meta, states)
@@ -668,6 +758,57 @@ class PLELayer(BaseOP):
         """
         lens = list(meta.seq_lens)
         num_reqs, width = len(lens), x.shape[1]
+
+        # Keep convolution launch shapes stable across scheduler chunks.  CPU
+        # oneDNN and some ROCm kernels can accumulate a different reduction
+        # order when sequence length changes; that made a donated radix/GDN
+        # snapshot differ bit-for-bit from a prefill stopped at its boundary.
+        # Chunking at FLA's fixed size gives both executions identical kernels
+        # for every completed chunk while retaining batched grouped convs.
+        from freetoken.kernel.fla.chunk import CHUNK_SIZE
+
+        if lens and max(lens) >= CHUNK_SIZE:
+            state = self._read_state(meta, states, x.dtype)
+            offsets = [0]
+            for n in lens:
+                offsets.append(offsets[-1] + n)
+            working = state.clone()
+            outputs = [x.new_empty((n, width)) for n in lens]
+            cursors = [0] * num_reqs
+            while True:
+                active = [i for i, n in enumerate(lens) if cursors[i] < n]
+                if not active:
+                    break
+                groups = {}
+                for i in active:
+                    n = min(CHUNK_SIZE, lens[i] - cursors[i])
+                    groups.setdefault(n, []).append(i)
+                for n, requests in groups.items():
+                    history = torch.stack(
+                        [
+                            torch.cat(
+                                [
+                                    working[i],
+                                    x[
+                                        offsets[i] + cursors[i] : offsets[i] + cursors[i] + n
+                                    ].transpose(0, 1),
+                                ],
+                                dim=1,
+                            )
+                            for i in requests
+                        ],
+                        dim=0,
+                    )
+                    conv = F.conv1d(
+                        history, self.conv1d.weight, groups=width, dilation=self.dilation
+                    )
+                    for j, i in enumerate(requests):
+                        outputs[i][cursors[i] : cursors[i] + n] = conv[j].transpose(0, 1)
+                        working[i] = history[j, :, -self.state_len :]
+                        cursors[i] += n
+            states.index_copy_(0, meta.state_slots, working.to(states.dtype))
+            return F.silu(torch.cat(outputs, dim=0))
+
         out_index, state_index, next_state_index = self._prefill_indices(lens, x.device)
 
         state = self._read_state(meta, states, x.dtype)

@@ -51,7 +51,7 @@ class GroupedPlusOneRMSNorm(BaseOP):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the kernel is 2D-only, higher-rank callers keep the torch chain
-        if x.is_cuda and x.dim() == 2:
+        if x.is_cuda and torch.version.hip is None and x.dim() == 2:
             return grouped_gemma_rmsnorm(x, self.weight, self.eps, self.num_groups)
         return grouped_plus_one_rms_norm(x, self.weight, self.eps, self.num_groups)
 
@@ -96,9 +96,15 @@ class GatedResidual(BaseOP):
         if use_combine:
             # 16-row alignment for the merged skinny GEMM (vLLM hyperconnection.py:98)
             self.pad_size = (-(self.lowrank + self.hc_count)) % 16
-            self.input_mix_weight_down_block_inject = LinearReplicated(
-                width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
-            )
+            if getattr(config, "attn_quant", "none") == "gguf":
+                from freetoken.layers.gguf import GGUFLinear
+
+                self.input_mix_weight_down = GGUFLinear(width, self.lowrank, 8)
+                self.block_inject_weight = LinearReplicated(width, self.hc_count, has_bias=False)
+            else:
+                self.input_mix_weight_down_block_inject = LinearReplicated(
+                    width, self.lowrank + self.hc_count + self.pad_size, has_bias=False
+                )
         else:
             self.pad_size = 0
             self.input_mix_weight_down = LinearReplicated(width, self.lowrank, has_bias=False)
@@ -108,6 +114,8 @@ class GatedResidual(BaseOP):
         """Run the down GEMM and split off the raw inject logits; the pad columns are dropped."""
         if not self.use_combine:
             return self.input_mix_weight_down.forward(rn), None
+        if hasattr(self, "block_inject_weight"):
+            return self.input_mix_weight_down.forward(rn), self.block_inject_weight.forward(rn)
         down = self.input_mix_weight_down_block_inject.forward(rn)
         # both slices keep unit inner stride, so the kernels read them without a copy
         return down[:, : self.lowrank], down[:, self.lowrank : self.lowrank + self.hc_count]
@@ -135,11 +143,13 @@ class GatedResidual(BaseOP):
 
     def mix(self, R: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor | None]:
         """Return the block input ``x [T, hidden]`` and the inject logits ``s [T, hc_count]`` (None if no combine)."""
-        return self._mix_kernel(R) if R.is_cuda else self._mix_torch(R)
+        # Triton HC kernels are CUDA-tuned.  ROCm gfx1100 can leave their
+        # launch waiting forever; pure Torch keeps bounded, synchronous semantics.
+        return self._mix_kernel(R) if R.is_cuda and torch.version.hip is None else self._mix_torch(R)
 
     def combine(self, R: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
         """Inject the block output ``y [T, hidden]`` back into every stream of ``R``."""
-        if R.is_cuda:
+        if R.is_cuda and torch.version.hip is None:
             return hc_combine(R, y, s, self.hc_count)
         return self._combine_torch(R, y, s)
 

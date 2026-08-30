@@ -44,9 +44,14 @@ parsers all resolve automatically from the checkpoint and the GPU.
 | `--max-running-requests` | 4 | Max concurrently running requests |
 | `--max-output-tokens` | 32768 | Default output budget for requests that omit one |
 | `--max-seq-len-override` | from checkpoint | Max sequence length |
+| `--kv-cache-dtype` | auto | KV storage dtype; `q8` is supported for QSA models while compute/index state stays 16-bit |
 | `--max-prefill-length` | 8192 | Chunked-prefill chunk size in tokens |
 | `--cuda-graph-max-bs`, `--graph` | = max running requests | Max batch size captured as CUDA graphs |
 | `--decode-log-interval` | 40 | Scheduler status line every N decode steps |
+| `--request-timeout-s` | 3600 | Total OpenAI request deadline, including admission and finalization |
+| `--max-pending-requests` | 0 | Explicit queued-request budget; zero keeps serial compatibility budget |
+| `--sse-heartbeat-s` | 15 | Data-bearing SSE keepalive interval; must be below request deadline |
+| `--ple-probe-timeout-s` | 300 | Parent deadline for startup PLE probe before readiness |
 
 ### Choosing a GPU
 
@@ -82,6 +87,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-backend` | auto | `fused`/`offload`/`cpu`/`hybrid`; auto → offload, or hybrid with a `ft bench bw` profile |
 | `--moe-cache-size` / `--moe-cache-rate` / `--moe-cache-auto` | auto | GPU expert-cache size as slots / fraction of all experts / sized from free VRAM (mutually exclusive; auto is enabled by default for offload-family backends) |
 | `--kv-reserve-tokens` | 8192 | KV token floor reserved before `--moe-cache-auto` fills experts |
+| `--kv-reserve-fallback-tokens` | unset | Lower KV floor retried when the primary auto-cache floor cannot fit |
 | `--moe-cpu-threads` | physical cores | CPU worker threads for the cpu/hybrid executor |
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
@@ -172,4 +178,33 @@ profile that `ft serve --moe-backend auto` and `--moe-hybrid-max-fetch -1` then 
 - What to measure: `--dtype`, `--model`, `--formats`, `--isa`.
 - `--threshold` (default 2.0) sets the call: recommend hybrid when CPU bandwidth beats PCIe
   by that factor.
+# Qwen4-Exp PLE options
 
+Standard ROCm/GGUF serving resolves `--ple-mode auto` to the packed, sidecar-backed
+`paged` backend. PLE IQ4_NL rows flow through `.ftple` 4 KiB SSD pages, bounded RAM
+LRU, pinned staging, and optional GPU packed-row cache; generic GGUF mmap is not used
+for paged PLE.
+
+Available controls:
+
+`--ple-mode {auto,resident,paged,direct-gguf}` (deprecated `ssd` alias),
+`--ple-store PATH`, `--ple-store-build {auto,never,force}`,
+`--ple-ram-cache-mib`, `--ple-row-cache-mib`, `--ple-gpu-cache-mib`,
+`--ple-staging-mib`, `--ple-io {auto,direct,buffered}`, `--ple-io-depth`, and
+`--ple-prefetch-depth`. Qwen ROCm can reserve a shared bounded host tier with
+`--qwen38-host-cache-mib` and split packed expert bytes with
+`--qwen38-expert-host-cache-mib`; `auto` is clamped before model allocation.
+
+Qwen3.8 ROCm expert residency and grouped execution are independent of PLE:
+`--qwen38-expert-residency {ram,mmap,auto,auto-tier}` (CLI default `ram`; the
+production ROCm script uses `auto`),
+`--qwen38-moe-grouped` (default on), and `--qwen38-moe-scratch-mib` (default
+128). The production script exports matching `FT_QWEN38_*` variables. `ram`
+materializes packed IQ banks in host RAM; `mmap` is compatibility fallback and
+does not move PLE. No swap-backed residency is accepted.
+
+Build a sidecar once with `ft checkpoint build-ple-store --model MODEL.gguf`
+(`--out`/`--output` overrides location). `resident` requires the complete packed
+table plus headroom in application RAM. `direct-gguf` remains experimental and
+is rejected on tinygrad; production acceptance covers `paged`. Swap is never
+counted as PLE cache RAM.

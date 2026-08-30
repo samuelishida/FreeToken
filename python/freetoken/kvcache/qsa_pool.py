@@ -63,6 +63,7 @@ class QSAKVCache(MHAKVCache):
         num_req_slots: int,
         ring_capacity: int | None = None,
         layer_ids: Sequence[int] | None = None,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         if index_ratio < 1 or page_size % index_ratio != 0:
             # slot // index_ratio only names one group when a group never straddles a page.
@@ -88,6 +89,9 @@ class QSAKVCache(MHAKVCache):
         self._num_req_slots = num_req_slots
         self._ring_capacity = ring_capacity
         self._index_dtype = dtype
+        self._kv_dtype = kv_dtype or dtype
+        if self._kv_dtype not in (dtype, torch.int8):
+            raise ValueError(f"QSA KV dtype must be {dtype} or torch.int8, got {self._kv_dtype}")
         self._page_size = page_size
         super().__init__(
             num_kv_heads=num_kv_heads,
@@ -95,12 +99,26 @@ class QSAKVCache(MHAKVCache):
             head_dim=head_dim,
             num_pages=num_pages,
             page_size=page_size,
-            dtype=dtype,
+            dtype=self._kv_dtype,
             device=device,
             layer_ids=layer_ids,
         )
+        self._k_scale_buffer = None
+        self._v_scale_buffer = None
+        self._alloc_q8_scales()
         self._zero_kv_slabs()
         self._alloc_index_tiers(num_pages)
+
+    def _alloc_q8_scales(self) -> None:
+        if not self.uses_q8:
+            return
+        shape = self._k_buffer.shape[:-1]
+        self._k_scale_buffer = torch.empty(shape, dtype=self._index_dtype, device=self._device)
+        self._v_scale_buffer = torch.empty(shape, dtype=self._index_dtype, device=self._device)
+
+    @property
+    def uses_q8(self) -> bool:
+        return self._kv_dtype is torch.int8
 
     def _zero_kv_slabs(self) -> None:
         # Defense-in-depth: the attend kernels pos-mask every K/V load (the real fix for
@@ -137,7 +155,10 @@ class QSAKVCache(MHAKVCache):
         # cannot drop a live request's pending members.
         self._cmp_k_buffer = None
         self._pending_ring = None
+        self._k_scale_buffer = None
+        self._v_scale_buffer = None
         super().rebuild(num_pages)
+        self._alloc_q8_scales()
         self._zero_kv_slabs()
         try:
             self._alloc_index_tiers(num_pages)
@@ -176,7 +197,54 @@ class QSAKVCache(MHAKVCache):
             * self._index_head_dim
             * self._index_dtype.itemsize
         )
-        return kv + slab // tokens, swa
+        scales = 0
+        if self.uses_q8:
+            scales = (
+                self._k_scale_buffer.numel() + self._v_scale_buffer.numel()
+            ) * self._index_dtype.itemsize // tokens
+        return kv + slab // tokens + scales, swa
+
+    def store_kv(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        out_loc: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        if not self.uses_q8:
+            return super().store_kv(k, v, out_loc, layer_id)
+        from freetoken.kernel.triton.q8_kv import q8_store_cache
+
+        dense = self._dense(layer_id)
+        kv_heads = self._k_buffer.shape[-2]
+        head_dim = self._k_buffer.shape[-1]
+        q8_store_cache(
+            self._k_buffer[dense].view(-1, kv_heads, head_dim),
+            self._v_buffer[dense].view(-1, kv_heads, head_dim),
+            self._k_scale_buffer[dense].view(-1, kv_heads),
+            self._v_scale_buffer[dense].view(-1, kv_heads),
+            out_loc,
+            k.view(-1, kv_heads, head_dim),
+            v.view(-1, kv_heads, head_dim),
+        )
+
+    def k_scale_cache(self, index: int) -> torch.Tensor:
+        if not self.uses_q8:
+            raise RuntimeError("QSA K scales unavailable for non-Q8 cache")
+        return self._k_scale_buffer[self._dense(index)]
+
+    def v_scale_cache(self, index: int) -> torch.Tensor:
+        if not self.uses_q8:
+            raise RuntimeError("QSA V scales unavailable for non-Q8 cache")
+        return self._v_scale_buffer[self._dense(index)]
+
+    @property
+    def kv_dtype(self) -> torch.dtype:
+        return self._kv_dtype
+
+    @property
+    def index_dtype(self) -> torch.dtype:
+        return self._index_dtype
 
     def cmp_k_cache(self, slot: int) -> torch.Tensor:
         """Compressed index keys of one sparse layer: ``[rows, index_head_dim]``."""

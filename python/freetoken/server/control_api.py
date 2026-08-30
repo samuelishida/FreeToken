@@ -35,6 +35,8 @@ def build_health(state: Any, version: str) -> dict:
             },
             "model": model,
             "instance_id": instance_id,
+            "ple_probe": getattr(state, "ple_probe", None),
+            "ple_probe_timeout_s": getattr(state, "ple_probe_timeout_s", None),
         }
 
     ready_at = getattr(state, "ready_at", None)
@@ -46,6 +48,8 @@ def build_health(state: Any, version: str) -> dict:
         "uptime_s": uptime_s,
         "maintenance": mstate,
         "version": version,
+        "ple_probe": getattr(state, "ple_probe", None),
+        "ple_probe_timeout_s": getattr(state, "ple_probe_timeout_s", None),
     }
 
 

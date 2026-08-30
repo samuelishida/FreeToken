@@ -14,7 +14,9 @@ it depends on none of them.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import math
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -22,6 +24,7 @@ from typing import Any
 
 from . import request_ring
 from freetoken.core import SamplingParams
+from freetoken.engine.config import DEFAULT_REQUEST_TIMEOUT_S
 from freetoken.message import TokenizeMsg
 from freetoken.tokenizer.tokenize import resolve_thinking_mode
 
@@ -52,6 +55,72 @@ class GenerationError(Exception):
     def __init__(self, message: str, code: str | None = None):
         super().__init__(message)
         self.code = code
+
+
+class GenerationTimeout(GenerationError):
+    """Finite request deadline expired at a named lifecycle stage."""
+
+    def __init__(
+        self,
+        stage: str,
+        timeout_s: float,
+        elapsed_s: float,
+        *,
+        uid: int | None = None,
+    ) -> None:
+        self.stage = stage
+        self.timeout_s = float(timeout_s)
+        self.elapsed_s = float(elapsed_s)
+        self.uid = uid
+        self.aborted = False
+        super().__init__(
+            f"generation timed out during {stage} after {elapsed_s:.3f}s "
+            f"(deadline {timeout_s:.3f}s)",
+            code="request_timeout",
+        )
+
+
+@dataclass
+class RequestDeadline:
+    """Monotonic total wall-clock budget shared by admission and generation."""
+
+    timeout_s: float
+    started_at: float
+    uid: int | None = None
+    stage: str = "request"
+
+    @classmethod
+    def start(cls, state: Any) -> "RequestDeadline":
+        raw_timeout = getattr(
+            getattr(state, "config", None), "request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S
+        )
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("request_timeout_s must be a positive finite number") from exc
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("request_timeout_s must be a positive finite number")
+        return cls(timeout_s=timeout, started_at=time.monotonic())
+
+    def remaining(self) -> float:
+        return self.timeout_s - (time.monotonic() - self.started_at)
+
+    async def wait(self, awaitable, stage: str):
+        self.stage = stage
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise GenerationTimeout(
+                stage, self.timeout_s, self.timeout_s, uid=self.uid
+            )
+        try:
+            return await asyncio.wait_for(awaitable, timeout=remaining)
+        except asyncio.TimeoutError as exc:
+            raise GenerationTimeout(
+                stage,
+                self.timeout_s,
+                time.monotonic() - self.started_at,
+                uid=self.uid,
+            ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -262,19 +331,51 @@ def split_tool_lists(
 # --------------------------------------------------------------------------- #
 # The primitive: submit + generate (consume a GenSpec, drive the engine waist).
 # --------------------------------------------------------------------------- #
-async def submit_generation(spec: GenSpec, state: Any) -> int:
+async def submit_generation(
+    spec: GenSpec, state: Any, *, deadline: RequestDeadline | None = None
+) -> int:
     """Enqueue one generation from a GenSpec; return its uid. Every protocol adapter
     calls this — it takes the neutral spec, not a wire request type."""
     uid = state.new_user()
-    await state.send_one(
-        TokenizeMsg(
-            uid=uid,
-            text=spec.messages,
-            sampling_params=spec.sampling_params,
-            chat_template_kwargs=spec.chat_template_kwargs,
-            tools=spec.template_tools,
+    if deadline is not None:
+        deadline.uid = uid
+    try:
+        send = state.send_one(
+            TokenizeMsg(
+                uid=uid,
+                text=spec.messages,
+                sampling_params=spec.sampling_params,
+                chat_template_kwargs=spec.chat_template_kwargs,
+                tools=spec.template_tools,
+            )
         )
-    )
+        if deadline is not None:
+            await deadline.wait(send, "admission")
+        else:
+            await send
+    except GenerationTimeout as exc:
+        # A uid is allocated before enqueue. Always release it when a bounded queue or ZMQ
+        # transport stalls, otherwise max-running-requests remains consumed forever.
+        abort = getattr(state, "abort_user", None)
+        if abort is not None:
+            await abort(uid)
+            exc.aborted = True
+        raise
+    except asyncio.CancelledError:
+        abort = getattr(state, "abort_user", None)
+        if abort is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(abort(uid))
+        raise
+    except Exception:
+        # Any non-timeout transport/admission failure after uid allocation must release the
+        # frontend accounting slot too; otherwise one transient ZMQ error permanently consumes
+        # max-running-requests until process restart.
+        abort = getattr(state, "abort_user", None)
+        if abort is not None:
+            with contextlib.suppress(Exception):
+                await abort(uid)
+        raise
     return uid
 
 
@@ -457,6 +558,8 @@ async def with_keepalive(events: AsyncIterator[GenEvent], interval: float):
     finally:
         if task is not None:
             task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                await task
 
 
 def _record_generation(

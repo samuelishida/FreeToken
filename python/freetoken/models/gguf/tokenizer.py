@@ -20,6 +20,9 @@ logger = init_logger(__name__)
 _TOKENIZER_ARCH = {
     "gemma4": "gemma4_text",
     "qwen35moe": "qwen3_moe",
+    # Qwen4Exp keeps Qwen3's BPE/tokenizer contract; Transformers has no
+    # qwen4exp converter key yet, so use its existing Qwen3-MoE converter.
+    "qwen4exp": "qwen3_moe",
 }
 
 

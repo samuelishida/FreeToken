@@ -74,6 +74,9 @@ class Req:
     # handler must not free resources under an in-flight forward; it sets this flag and
     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
     aborted: bool = False
+    # Monotonic PLE/n-gram context generation.  Row-id metadata may be reused
+    # only within same request version; completion advances it before next decode.
+    ple_context_version: int = 0
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu
@@ -103,6 +106,7 @@ class Req:
     def complete_one(self) -> None:
         self.cached_len = self.device_len
         self.device_len += 1
+        self.ple_context_version += 1
 
     def append_host(self, next_token: torch.Tensor) -> None:
         n = self.input_ids.numel()
@@ -161,6 +165,10 @@ class Batch:
     # _prepare_batch succeeds. Continuation chunks leave this empty, so accounting is
     # exactly-once.
     prompt_admissions: List[Tuple[int, int, int]] = field(default_factory=list, init=False)
+    # Scheduler-owned PLE metadata identity.  Kept out of wire messages; model
+    # uses it to reject row-id reuse across COW/continuation generations.
+    ple_context_version: int | None = field(default=None, init=False)
+    ple_cache_handle: object | None = field(default=None, init=False)
 
     @property
     def is_prefill(self) -> bool:

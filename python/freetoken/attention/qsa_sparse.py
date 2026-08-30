@@ -32,6 +32,7 @@ static buffers (``prepare_for_replay``) so the whole path is CUDA-graph capturab
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List
 
@@ -88,10 +89,38 @@ class QSASparseMetadata(BaseAttnMetadata):
     cmp_rows:         torch.Tensor | None = None  # [T] int32, compressed slab destination
     ring_rows:        torch.Tensor | None = None  # [T] int32, flat ring row or -1
     positions:        torch.Tensor | None = None  # [T] int32, logical query positions
+    prefill_plan:     "QSAPrefillPlan | None" = None
     # fmt: on
 
     def get_last_indices(self, bs: int) -> torch.Tensor:
         return self.last_indices[:bs]
+
+
+@dataclass(frozen=True)
+class QSAPrefillPlan:
+    """Live prefill geometry. Decode keeps fixed graph-safe tensor shapes."""
+
+    page_columns: int
+    score_columns: int
+    token_topk: int
+    ratio: int
+
+    @property
+    def select_width(self) -> int:
+        return self.token_topk + self.ratio - 1
+
+
+def _make_prefill_plan(lengths: List[int], ratio: int, token_budget: int, cmp_page_size: int) -> QSAPrefillPlan:
+    """CPU-only geometry calculation; safe before model kernels begin."""
+    max_complete = max((int(length) // ratio for length in lengths), default=0)
+    score_columns = max(cmp_page_size, -(-max_complete // cmp_page_size) * cmp_page_size)
+    token_topk = max(ratio, min(token_budget, max_complete * ratio))
+    return QSAPrefillPlan(
+        page_columns=score_columns // cmp_page_size,
+        score_columns=score_columns,
+        token_topk=token_topk,
+        ratio=ratio,
+    )
 
 
 class QSASparseAttnBackend(BaseAttnBackend):
@@ -108,7 +137,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
             f"qsa_sparse backend needs a QSA pool, got {type(self.kvcache).__name__}"
         )
         self.device = self.kvcache.device
-        self.dtype = self.kvcache.dtype
+        # Q8 mode stores main K/V as int8, while index projections, compressed index
+        # slabs, and all transient routing tensors remain in compute dtype.
+        self.dtype = getattr(self.kvcache, "index_dtype", self.kvcache.dtype)
         self.index_head_dim = self.kvcache.index_head_dim
         self.ratio = self.kvcache.index_ratio
         self.ring_capacity = self.kvcache.ring_capacity
@@ -119,6 +150,9 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self.cmp_page_size = self.page_size // self.ratio
         self.block_topk = self.token_topk // self.ratio
         self.select_width = self.token_topk + self.ratio - 1
+        # Inc 5 wires validated CLI/config. Keep legacy full-width prefill until then.
+        self._live_width_prefill = bool(getattr(config, "qwen38_qsa_prefill_live_width", False))
+        self._auto_live_logged = False
         assert self.token_topk % self.ratio == 0, "QSA budget must be a whole number of blocks"
         # The sparse attend kernel bakes 1/sqrt(head_dim) into its exp2 scale.
         assert config.attn_sm_scale in (None, self.head_dim**-0.5), (
@@ -134,6 +168,20 @@ class QSASparseAttnBackend(BaseAttnBackend):
         # decode staging (static buffers under CUDA graphs; eager decode snapshots per step)
         self._graph: dict[str, torch.Tensor] = {}
         self.capture_bs: List[int] = []
+        self._perf = {
+            "qsa_forward_calls": 0, "qsa_prefill_calls": 0,
+            "qsa_live_columns": 0, "qsa_allocated_columns": 0,
+            "qsa_score_submit_us": 0, "qsa_topk_submit_us": 0,
+            "qsa_attend_submit_us": 0,
+        }
+
+    def report(self) -> dict[str, int]:
+        """Host submission counters. GPU duration belongs to benchmark-only event tracing."""
+        return dict(self._perf)
+
+    def _inc_perf(self, **counts: int) -> None:
+        for name, value in counts.items():
+            self._perf[name] = self._perf.get(name, 0) + int(value)
 
     @staticmethod
     def _qsa_group(config: ModelConfig):
@@ -202,6 +250,25 @@ class QSASparseAttnBackend(BaseAttnBackend):
             md.seq_lens = kv_len.to(self.device, non_blocking=True)
             md.ring_slots = table_idx.to(self.device, non_blocking=True)
             md.block_table = self._block_table(md.ring_slots.to(torch.int64))
+            # The legacy full-width score slab is acceptable for short prefills,
+            # but it scales with the maximum KV table (393216 columns on the
+            # production Qwen3.8 config) and can consume >1 GiB per QSA layer.
+            # Switch medium/long prefills to live geometry automatically even
+            # when compatibility flag is off; on a 24 GiB ROCm card, full-width
+            # scoring already exhausts memory around a 1K-token chunk. Keep
+            # sub-512-token prompts on legacy geometry for lower TTFT.
+            max_kv = max(seqlens_k, default=0)
+            use_live_width = self._live_width_prefill or max_kv > 512
+            if use_live_width and max_kv > 512 and not self._live_width_prefill and not self._auto_live_logged:
+                logger.info(
+                    "qsa_sparse: enabling live-width prefill geometry for long prompt "
+                    f"(kv={max_kv}; full score slab avoided)"
+                )
+                self._auto_live_logged = True
+            if use_live_width:
+                md.prefill_plan = _make_prefill_plan(
+                    seqlens_k, self.ratio, self.token_topk, self.cmp_page_size
+                )
         # Decode addressing is DEFERRED: a graph-bound step stages it into the static
         # buffers (prepare_for_replay), an eager step snapshots at the first QSA layer.
 
@@ -271,6 +338,10 @@ class QSASparseAttnBackend(BaseAttnBackend):
         md = batch.attn_metadata
         assert isinstance(md, QSASparseMetadata)
         slot = self._idx_slot[layer_id]
+        self._inc_perf(qsa_forward_calls=1)
+        is_prefill = not md.is_decode
+        if is_prefill:
+            self._inc_perf(qsa_prefill_calls=1)
         self.kvcache.store_kv(k, v, batch.out_loc, layer_id)
         if md.block_table is None:
             self._snapshot_decode(md, batch)
@@ -282,15 +353,22 @@ class QSASparseAttnBackend(BaseAttnBackend):
 
         self._update_index_cache(index, md, slot)
         indices = self._select(index, md, slot)
-        return qsa_sparse_paged_attention(
+        q8 = getattr(self.kvcache, "uses_q8", False)
+        block_table = self._active_block_table(md)
+        started = time.perf_counter_ns()
+        output = qsa_sparse_paged_attention(
             q,
             self.kvcache.k_cache(layer_id),
             self.kvcache.v_cache(layer_id),
             indices,
-            md.block_table,
+            block_table,
             md.token_to_req,
             torch.empty_like(q),
+            k_scale_cache=(self.kvcache.k_scale_cache(layer_id) if q8 else None),
+            v_scale_cache=(self.kvcache.v_scale_cache(layer_id) if q8 else None),
         )
+        self._inc_perf(qsa_attend_submit_us=(time.perf_counter_ns() - started) // 1000)
+        return output
 
     def _plan_index_writes(self, md: QSASparseMetadata, batch: Batch) -> None:
         """Per-token slab row and ring row for this forward; the other QSA layers reuse it
@@ -374,18 +452,29 @@ class QSASparseAttnBackend(BaseAttnBackend):
             heads=self.index_heads,
         )
         cmp_pages = self._cmp_pages(slot)
-        columns = md.block_table.shape[1] * self.cmp_page_size
-        indices = self._scratch("indices", rows, self.select_width, dtype=torch.int32)
+        plan = md.prefill_plan if not md.is_decode else None
+        block_table = self._active_block_table(md)
+        columns = block_table.shape[1] * self.cmp_page_size
+        token_topk = self.token_topk if plan is None else plan.token_topk
+        block_topk = token_topk // self.ratio
+        select_width = self.select_width if plan is None else plan.select_width
+        if not md.is_decode:
+            self._inc_perf(
+                qsa_live_columns=max((int(length) // self.ratio for length in md.kv_len_cpu), default=0),
+                qsa_allocated_columns=columns,
+            )
+        indices = self._scratch("indices", rows, select_width, dtype=torch.int32)
         rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
         for start in range(0, rows, rows_per_chunk):
             end = min(start + rows_per_chunk, rows)
             chunk = slice(start, end)
             logits = self._scratch("logits", end - start, columns, dtype=torch.float32)
             visible = self._scratch("visible", end - start, dtype=torch.int32)
+            started = time.perf_counter_ns()
             qsa_mqa_paged(
                 q_index[chunk],
                 cmp_pages,
-                md.block_table,
+                block_table,
                 md.token_to_req[chunk],
                 positions[chunk],
                 md.seq_lens,
@@ -393,18 +482,26 @@ class QSASparseAttnBackend(BaseAttnBackend):
                 logits,
                 visible,
             )
-            blocks = self._scratch("blocks", end - start, self.block_topk, dtype=torch.int32)
+            self._inc_perf(qsa_score_submit_us=(time.perf_counter_ns() - started) // 1000)
+            blocks = self._scratch("blocks", end - start, block_topk, dtype=torch.int32)
+            started = time.perf_counter_ns()
             self._top_blocks(logits, visible, blocks)
+            self._inc_perf(qsa_topk_submit_us=(time.perf_counter_ns() - started) // 1000)
             expand_qsa_block_indices(
                 blocks,
                 positions[chunk],
                 md.seq_lens,
                 md.token_to_req[chunk],
                 self.ratio,
-                self.token_topk,
+                token_topk,
                 indices[chunk],
             )
         return indices
+
+    @staticmethod
+    def _active_block_table(md: QSASparseMetadata) -> torch.Tensor:
+        assert md.block_table is not None
+        return md.block_table if md.prefill_plan is None else md.block_table[:, :md.prefill_plan.page_columns]
 
     def _top_blocks(
         self,
@@ -413,11 +510,12 @@ class QSASparseAttnBackend(BaseAttnBackend):
         blocks: torch.Tensor,
     ) -> None:
         """Top ``block_topk`` complete blocks per row, row-relative, -1 padded."""
-        assert blocks.shape == (logits.shape[0], self.block_topk), (
-            f"qsa block top-k output must be [rows, {self.block_topk}], got {tuple(blocks.shape)}"
+        block_topk = blocks.shape[1]
+        assert blocks.shape == (logits.shape[0], block_topk), (
+            f"qsa block top-k output must be [rows, {block_topk}], got {tuple(blocks.shape)}"
         )
         if self._block_topk_kernel is not None:
-            scratch_width = self._topk_scratch_width(logits.shape[1])
+            scratch_width = self._topk_scratch_width(logits.shape[1], block_topk)
             scratch = (
                 self._scratch("topk_scratch", logits.shape[0], scratch_width, dtype=torch.int32)
                 if scratch_width
@@ -430,19 +528,19 @@ class QSASparseAttnBackend(BaseAttnBackend):
         columns = logits.shape[1]
         column = torch.arange(columns, dtype=torch.int32, device=logits.device)
         logits.masked_fill_(column.unsqueeze(0) >= visible.unsqueeze(1), -float("inf"))
-        width = min(self.block_topk, columns)
+        width = min(block_topk, columns)
         values, chosen = torch.topk(logits, width, dim=-1)
         blocks[:, :width] = torch.where(values > -float("inf"), chosen.to(torch.int32), -1)
-        if width < self.block_topk:
+        if width < block_topk:
             blocks[:, width:] = -1
 
-    def _topk_scratch_width(self, columns: int) -> int:
+    def _topk_scratch_width(self, columns: int, topk: int | None = None) -> int:
         """int32 columns per row the block top-k wants as scratch, 0 when it wants none."""
         if self._block_topk_kernel is None:
             return 0
         from freetoken.kernel.triton.qsa import qsa_block_topk_scratch_width
 
-        return qsa_block_topk_scratch_width(columns, self.block_topk)
+        return qsa_block_topk_scratch_width(columns, self.block_topk if topk is None else topk)
 
     # ----- scratch ------------------------------------------------------------------------
     def _scratch(self, name: str, rows: int, *shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -504,4 +602,4 @@ class QSASparseAttnBackend(BaseAttnBackend):
         self._graph = {}
 
 
-__all__ = ["QSASparseAttnBackend", "QSASparseMetadata"]
+__all__ = ["QSASparseAttnBackend", "QSASparseMetadata", "QSAPrefillPlan"]

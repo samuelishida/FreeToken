@@ -23,9 +23,16 @@ def expert_bytes_per_slot(sources: dict[str, "list[torch.Tensor]"]) -> int:
     """
     # marlin/b12x gate_up/down alpha scales are fixed [L*E] residency (do not scale
     # with cache_size), so they are intentionally excluded from the per-slot growth term.
-    # tensor[0].numel() is the per-row element count (one expert slot); see the matching
-    # slot-byte idiom in kvcache/linear_state_pool.py and kvcache/dsv4_paged_pool.py.
-    return sum(t[0][0].numel() * t[0].element_size() for t in sources.values())
+    # tensor[0] contains one layer's expert bank. Divide its element count by
+    # the expert dimension to get one complete slot, then use largest layer
+    # geometry so mixed-width banks cannot under-size the allocation.
+    total = 0
+    for layers in sources.values():
+        total += max(
+            bank[0].numel() * bank.element_size()
+            for bank in layers
+        )
+    return total
 
 
 def net_cache_budget_bytes(

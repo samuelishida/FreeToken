@@ -109,7 +109,10 @@ def _version_parts(version: str) -> Tuple[str, List[str]]:
 def _build_stamps(local_segments: List[str]) -> List[str]:
     """The `g<sha>` commit-stamp tokens of a local version segment list
     (``["cu130", "g3f01615"]`` -> ``["g3f01615"]``)."""
-    return [s for s in local_segments if s.startswith("g")]
+    # Keep arbitrary local metadata (for example ``gabcdefgh``) out of the
+    # build identity.  Only a ``g`` token followed by hexadecimal commit
+    # digits is a stamp produced by our wheel build.
+    return [s for s in local_segments if re.fullmatch(r"g[0-9a-fA-F]+", s)]
 
 
 def _arch_tags(local_segments: List[str]) -> List[str]:

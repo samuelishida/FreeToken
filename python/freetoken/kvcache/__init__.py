@@ -111,6 +111,7 @@ def create_kv_pool(config, num_pages: int, device: torch.device, dtype: torch.dt
         device=device,
         dtype=dtype,
         num_req_slots=config.max_running_req + 1,  # + 1 for the dummy request row
+        kv_cache_dtype=getattr(config, "kv_cache_dtype", "auto"),
     )
 
 
@@ -122,6 +123,7 @@ def create_kvcache_pool(
     device: torch.device,
     num_swa_tokens: int | None = None,
     num_req_slots: int | None = None,
+    kv_cache_dtype: str = "auto",
 ) -> BaseKVCachePool:
     if model_config.has_swa_attention:
         from .hybrid_swa_pool import HybridSWAKVCache
@@ -185,11 +187,21 @@ def create_kvcache_pool(
     # layer_ids is mandatory here -- the model is hybrid-linear, and letting MHAKVCache back
     # all num_layers would allocate K/V slabs for the GDN layers too.
     if len(kv_specs) == 1 and kv_specs[0].attn_type == _AttnType.QSA:
+        import torch
         from .qsa_pool import QSAKVCache
 
         spec = kv_specs[0]
         if num_req_slots is None:
             raise ValueError("QSA pools need num_req_slots (max_running_req + 1)")
+        kv_dtype_name = kv_cache_dtype
+        if kv_dtype_name in ("auto", "bfloat16"):
+            kv_dtype = dtype if kv_dtype_name == "auto" else torch.bfloat16
+        elif kv_dtype_name == "float16":
+            kv_dtype = torch.float16
+        elif kv_dtype_name == "q8":
+            kv_dtype = torch.int8
+        else:
+            raise ValueError(f"unsupported QSA KV dtype {kv_dtype_name!r}")
         return QSAKVCache(
             num_kv_heads=spec.num_kv_heads,
             num_layers=model_config.num_layers,
@@ -197,6 +209,7 @@ def create_kvcache_pool(
             num_pages=num_pages,
             page_size=page_size,
             dtype=dtype,
+            kv_dtype=kv_dtype,
             device=device,
             index_head_dim=spec.index_head_dim,
             num_index_layers=spec.num_index_layers,

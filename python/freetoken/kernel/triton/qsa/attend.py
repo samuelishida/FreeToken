@@ -15,6 +15,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
     indices_ptr,
     block_table_ptr,
     token_to_req_ptr,
@@ -29,6 +31,12 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_v_block,
     stride_v_token,
     stride_v_head,
+    stride_k_scale_block,
+    stride_k_scale_token,
+    stride_k_scale_head,
+    stride_v_scale_block,
+    stride_v_scale_token,
+    stride_v_scale_head,
     stride_indices_row,
     stride_table_req,
     stride_output_row,
@@ -46,6 +54,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_Q8: tl.constexpr,
 ) -> None:
     # row * stride can overflow int32 for large row counts.
     row = tl.program_id(0).to(tl.int64)
@@ -108,8 +117,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             + kv_head * stride_k_head
             + dim_offsets[:, None],
             mask=valid[None, :],
-            other=0.0,
+            other=0,
         )
+        if KV_Q8:
+            keys = keys.to(tl.bfloat16)
+            k_scale = tl.load(
+                k_scale_cache_ptr
+                + safe_page * stride_k_scale_block
+                + page_offset * stride_k_scale_token
+                + kv_head * stride_k_scale_head,
+                mask=valid,
+                other=0.0,
+            )
+            keys *= k_scale[None, :]
         values = tl.load(
             v_cache_ptr
             + safe_page[:, None] * stride_v_block
@@ -117,8 +137,19 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
             + kv_head * stride_v_head
             + dim_offsets[None, :],
             mask=valid[:, None],
-            other=0.0,
+            other=0,
         )
+        if KV_Q8:
+            values = values.to(tl.bfloat16)
+            v_scale = tl.load(
+                v_scale_cache_ptr
+                + safe_page * stride_v_scale_block
+                + page_offset * stride_v_scale_token
+                + kv_head * stride_v_scale_head,
+                mask=valid,
+                other=0.0,
+            )
+            values *= v_scale[:, None]
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
         scores *= softmax_scale_log2
@@ -232,8 +263,10 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA directly over paged BF16 K/V caches."""
+    """Run sparse GQA over paged BF16 or per-vector-Q8 K/V caches."""
 
     if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
@@ -247,7 +280,15 @@ def qsa_sparse_paged_attention(
         raise ValueError("QSA sparse attention requires valid grouped-query heads")
     head_dim = q.shape[2]
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
-    assert q.dtype == k_cache.dtype == v_cache.dtype
+    q8 = k_cache.dtype == torch.int8
+    if q8:
+        assert v_cache.dtype == torch.int8
+        assert k_scale_cache is not None and v_scale_cache is not None
+        assert k_scale_cache.dtype == v_scale_cache.dtype == q.dtype
+    else:
+        assert q.dtype == k_cache.dtype == v_cache.dtype
+        k_scale_cache = k_cache
+        v_scale_cache = v_cache
     assert logical_indices.dtype == block_table.dtype == torch.int32
     assert token_to_req.dtype == torch.int32
     assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
@@ -303,6 +344,8 @@ def qsa_sparse_paged_attention(
         q,
         k_cache,
         v_cache,
+        k_scale_cache,
+        v_scale_cache,
         logical_indices,
         block_table,
         token_to_req,
@@ -317,6 +360,12 @@ def qsa_sparse_paged_attention(
         v_cache.stride(0),
         v_cache.stride(1),
         v_cache.stride(2),
+        k_scale_cache.stride(0),
+        k_scale_cache.stride(1),
+        k_scale_cache.stride(2) if k_scale_cache.ndim == 3 else 0,
+        v_scale_cache.stride(0),
+        v_scale_cache.stride(1),
+        v_scale_cache.stride(2) if v_scale_cache.ndim == 3 else 0,
         logical_indices.stride(0),
         block_table.stride(0),
         out.stride(0),
@@ -334,8 +383,11 @@ def qsa_sparse_paged_attention(
         NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        KV_Q8=q8,
         num_warps=partial_warps,
-        num_stages=2,
+        # RDNA3 exposes 64 KiB LDS; this Qwen4 shape is 65,792 bytes at two
+        # stages. HIP must compile one stage, while CUDA keeps tuned staging.
+        num_stages=1 if torch.version.hip is not None else 2,
     )
     if num_splits == 1:
         return out

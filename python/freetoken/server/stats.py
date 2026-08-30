@@ -6,7 +6,7 @@ average like tok_s), so idle polls decay to zero by wall clock."""
 from __future__ import annotations
 
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from typing import Any
 
 
@@ -37,6 +37,9 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        self._status_by_uid: "OrderedDict[int, dict[str, Any]]" = OrderedDict()
+        self.ple_counters: dict[str, int] = {}
+        self.status_seq = 0
 
     @property
     def active(self) -> int:
@@ -82,6 +85,39 @@ class StatsTracker:
                     self._aborting.discard(uid)
                 else:
                     self.completed += 1
+
+    def observe_status(self, event: Any) -> None:
+        """Apply live worker telemetry without allowing stale/reordered events to regress state."""
+        uid = int(getattr(event, "uid", -1))
+        seq = int(getattr(event, "seq", 0) or 0)
+        prior = self._status_by_uid.get(uid)
+        if prior is not None and seq <= int(prior.get("seq", 0)):
+            return
+        stage = str(getattr(event, "stage", "unknown"))[:64]
+        timestamp = float(getattr(event, "timestamp", 0.0) or 0.0)
+        raw_error = getattr(event, "error", None)
+        self._status_by_uid[uid] = {
+            "uid": uid, "stage": stage, "seq": seq, "timestamp": timestamp,
+            "error": (str(raw_error)[:512] if raw_error else None),
+        }
+        self._status_by_uid.move_to_end(uid)
+        while len(self._status_by_uid) > 4096:
+            self._status_by_uid.popitem(last=False)
+        self.status_seq = max(self.status_seq, seq)
+        for key, value in (getattr(event, "ple", None) or {}).items():
+            try:
+                number = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+            # Worker reports are cumulative. Monotonic max handles out-of-order IPC batches.
+            self.ple_counters[str(key)] = max(self.ple_counters.get(str(key), 0), number)
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "request_stage": list(self._status_by_uid.values()),
+            "ple_counters": dict(self.ple_counters),
+            "status_seq": self.status_seq,
+        }
 
     def _rate(self, window: "deque[tuple[float, int]]", now: float | None) -> float:
         t = time.monotonic() if now is None else now
@@ -173,4 +209,5 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
             "prompt_tokens_total": tr.prompt_tokens_total,
             "completion_tokens_total": tr.completion_tokens_total,
         },
+        "status": tr.status_snapshot(),
     }

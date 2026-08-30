@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from freetoken.message import UserReply
 from freetoken.server.accounting import (
     AccountingDrainError,
+    AdmissionBusyError,
     AdmissionClosedError,
     _is_loopback,
     prepare_stop_accounting,
@@ -135,6 +136,36 @@ def test_frontend_new_user_refuses_work_after_stop_gate_closes():
     with pytest.raises(AdmissionClosedError, match="stopping"):
         manager.new_user()
     assert manager.stats.active == 0
+
+
+def test_frontend_new_user_enforces_scheduler_request_budget():
+    manager = FrontendManager(
+        config=SimpleNamespace(served_model_name="model-a", max_running_req=1),
+        send_tokenizer=None,
+        recv_tokenizer=None,
+        maintenance_state="serving",
+    )
+    manager.new_user()
+    with pytest.raises(AdmissionBusyError, match="max-running-requests=1"):
+        manager.new_user()
+    assert manager.stats.active == 1
+
+
+def test_frontend_serial_engine_admits_bounded_pending_queue():
+    manager = FrontendManager(
+        config=SimpleNamespace(
+            served_model_name="qwen38", max_running_req=1,
+            model_config=SimpleNamespace(single_stream_only=True),
+        ),
+        send_tokenizer=None,
+        recv_tokenizer=None,
+        maintenance_state="serving",
+    )
+    for _ in range(4):
+        manager.new_user()
+    with pytest.raises(AdmissionBusyError, match="max-running-requests=4"):
+        manager.new_user()
+    assert manager.stats.active == 4
 
 
 def test_prepare_stop_route_reports_fail_closed_timeout():

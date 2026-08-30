@@ -81,15 +81,24 @@ class Qwen3_5MoE(BaseOP):
         self.shared_expert_gate = LinearReplicated(config.hidden_size, 1, has_bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        observe = getattr(self, "_status_observer", None)
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         # Compute the router + shared expert BEFORE the routed experts: the fused MoE
         # kernel may write into ``hidden_states`` in place, which would corrupt the
         # shared expert's input (HF also evaluates the shared expert first).
+        if observe is not None:
+            observe("moe_router_started")
         router_logits = self.gate.forward(hidden_states)
+        if observe is not None:
+            observe("moe_router_done")
         shared = self.shared_expert.forward(hidden_states)
         shared = shared * torch.sigmoid(self.shared_expert_gate.forward(hidden_states))
+        if observe is not None:
+            observe("moe_shared_done")
         routed = self.experts.forward(hidden_states=hidden_states, router_logits=router_logits)
+        if observe is not None:
+            observe("moe_routed_done")
         return (routed + shared).view(num_tokens, hidden_dim)
 
 

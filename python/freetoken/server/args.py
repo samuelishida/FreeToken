@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Tuple
 
 import torch
 from freetoken.distributed import DistributedInfo
+from freetoken.engine.config import DEFAULT_REQUEST_TIMEOUT_S
 from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
@@ -43,6 +45,32 @@ class ServerArgs(SchedulerConfig):
     gpu: tuple[str, ...] = ()
     # full UUIDs resolved from --gpu, entry i = TP rank i; None = NVML unavailable, each worker then resolves its raw entry against CUDA's own enumeration
     gpu_assigned: "tuple[str, ...] | None" = None
+    ple_store: str | None = None
+    ple_store_build: str = "auto"
+    ple_ram_cache_mib: int | str = 512
+    ple_row_cache_mib: int | str = 0
+    qwen38_host_cache_mib: int | str = 0
+    qwen38_expert_host_cache_mib: int | str = 0
+    ple_gpu_cache_mib: int = 128
+    ple_staging_mib: int = 32
+    ple_io: str = "auto"
+    ple_io_depth: int | str = 64
+    ple_ram_gib: float = 0.0
+    ple_workers: int = 2
+    ple_prefetch: bool = True
+    ple_mode: str = "auto"
+    ple_cache_policy: str = "lru"
+    ple_prefetch_depth: int | str = 64
+    ple_batched_cache: bool = False
+    ple_fused_dequant: bool = False
+    qwen38_qsa_prefill_live_width: bool = False
+    qwen38_moe_grouped: bool = True
+    qwen38_moe_scratch_mib: int = 128
+    qwen38_prefill_adaptive: bool = False
+    qwen38_expert_residency: str = "ram"
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    sse_heartbeat_s: float = 15.0
+    ple_probe_timeout_s: float = 300.0
 
     @property
     def share_tokenizer(self) -> bool:
@@ -75,6 +103,28 @@ class ServerArgs(SchedulerConfig):
     @property
     def distributed_addr(self) -> str:
         return f"tcp://127.0.0.1:{self.server_port + 1}"
+
+
+def resolve_admission_limits(config: Any) -> tuple[int, int, int]:
+    """Return ``(running, pending, total)`` frontend admission limits.
+
+    ``max_pending_requests=0`` is deliberately a compatibility sentinel. It
+    retains the historical serial-engine queue (up to four admitted requests
+    per scheduler slot), while non-serial engines remain capped at their
+    scheduler running limit. A positive value is explicit pending capacity in
+    addition to ``max_running_req``.
+    """
+    running = int(getattr(config, "max_running_req", 0) or 0)
+    pending = int(getattr(config, "max_pending_requests", 0) or 0)
+    if pending > 0:
+        return running, pending, max(0, running + pending)
+    try:
+        model_config = getattr(config, "model_config", None)
+    except Exception:  # noqa: BLE001 -- status/admission must survive partial startup state
+        model_config = None
+    serial = bool(getattr(model_config, "single_stream_only", False))
+    total = max(running * 4, running + 1) if serial and running > 0 else running
+    return running, max(0, total - running), total
 
 
 def parse_args(
@@ -111,6 +161,50 @@ def parse_args(
             raise argparse.ArgumentTypeError("must be a positive integer") from exc
         if n < 1:
             raise argparse.ArgumentTypeError("must be >= 1")
+        return n
+
+    def _nonnegative_int(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
+    def _budget(value: str) -> int | str:
+        value = str(value).strip().lower()
+        if value in ("auto", "adaptive"):
+            return value
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "must be auto, adaptive, or a non-negative integer"
+            ) from exc
+        if n < 0:
+            raise argparse.ArgumentTypeError("must be >= 0")
+        return n
+
+    def _depth(value: str) -> int | str:
+        value = str(value).strip().lower()
+        if value in ("auto", "adaptive"):
+            return value
+        try:
+            n = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be auto, adaptive, or an integer in [0, 256]") from exc
+        if not 0 <= n <= 256:
+            raise argparse.ArgumentTypeError("must be between 0 and 256")
+        return n
+
+    def _positive_finite_float(value: str) -> float:
+        try:
+            n = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a positive finite number") from exc
+        if n <= 0 or not math.isfinite(n):
+            raise argparse.ArgumentTypeError("must be a positive finite number")
         return n
 
     def _lazy_gpu_arg(value: str) -> tuple[str, ...]:
@@ -233,6 +327,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-cache-dtype",
+        choices=["auto", "bfloat16", "float16", "q8"],
+        default=ServerArgs.kv_cache_dtype,
+        help="KV storage dtype; q8 is supported for QSA models and keeps compute/index state 16-bit.",
+    )
+
+    parser.add_argument(
         "--tensor-parallel-size",
         "--tp-size",
         type=int,
@@ -260,13 +361,83 @@ def parse_args(
             "tinygrad fork's direct kfd/hsa backend)."
         ),
     )
+    parser.add_argument("--ple-store", type=str, default=None, help="Qwen4Exp .ftple sidecar (default: sibling GGUF)")
+    parser.add_argument("--ple-store-build", choices=("auto", "never", "force"), default="auto")
+    parser.add_argument("--ple-ram-cache-mib", type=_budget, default=512)
+    parser.add_argument("--ple-row-cache-mib", type=_budget, default=0)
+    parser.add_argument("--qwen38-host-cache-mib", type=_budget, default=0)
+    parser.add_argument("--qwen38-expert-host-cache-mib", type=_budget, default=0)
+    parser.add_argument("--ple-gpu-cache-mib", type=_nonnegative_int, default=128)
+    parser.add_argument("--ple-staging-mib", type=_nonnegative_int, default=32)
+    parser.add_argument("--ple-io", choices=("auto", "direct", "buffered"), default="auto")
+    parser.add_argument("--ple-io-depth", type=_depth, default=64)
+    parser.add_argument("--ple-prefetch-depth", type=_depth, default=64)
+    parser.add_argument("--ple-ram-gib", type=float, default=0.0, help="PLE RAM cache budget")
+    parser.add_argument("--ple-workers", type=_positive_int, default=2, help="PLE read workers")
+    parser.add_argument("--ple-prefetch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ple-mode", choices=("auto", "resident", "paged", "direct-gguf", "ssd"), default="auto")
+    parser.add_argument("--ple-cache-policy", choices=("lru", "2q"), default="lru")
+    parser.add_argument("--ple-batched-cache", action=argparse.BooleanOptionalAction, default=ServerArgs.ple_batched_cache)
+    parser.add_argument("--ple-fused-dequant", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--qwen38-qsa-prefill-live-width", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--qwen38-moe-grouped", action=argparse.BooleanOptionalAction,
+        default=ServerArgs.qwen38_moe_grouped,
+        help="Use grouped Qwen3.8 GGUF MoE execution (default: enabled).",
+    )
+    parser.add_argument(
+        "--qwen38-moe-scratch-mib", type=_positive_int,
+        default=ServerArgs.qwen38_moe_scratch_mib,
+        help="Bound selected Qwen3.8 MoE dequant scratch in MiB (default: 128).",
+    )
+    parser.add_argument(
+        "--qwen38-prefill-adaptive", action=argparse.BooleanOptionalAction,
+        default=ServerArgs.qwen38_prefill_adaptive,
+        help="Use conservative pre-forward 4096-token Qwen3.8 prefill admission when VRAM permits.",
+    )
+    parser.add_argument(
+        "--qwen38-expert-residency",
+        choices=("ram", "mmap", "auto", "auto-tier"),
+        default=ServerArgs.qwen38_expert_residency,
+        help=(
+            "Qwen3.8 GGUF routed expert source residency: packed anonymous host RAM "
+            "(ram, default), file-backed mmap compatibility mode, auto, or auto-tier."
+        ),
+    )
+    parser.add_argument(
+        "--request-timeout-s",
+        type=_positive_finite_float,
+        default=ServerArgs.request_timeout_s,
+        help="Total OpenAI request deadline in seconds (default: 3600).",
+    )
+    parser.add_argument(
+        "--sse-heartbeat-s",
+        type=_positive_finite_float,
+        default=ServerArgs.sse_heartbeat_s,
+        help="SSE keepalive interval in seconds (default: 15). Must be below request timeout.",
+    )
+    parser.add_argument(
+        "--ple-probe-timeout-s",
+        type=_positive_finite_float,
+        default=ServerArgs.ple_probe_timeout_s,
+        help="Parent startup PLE probe deadline in seconds (default: 300).",
+    )
 
     parser.add_argument(
         "--max-running-requests",
-        type=int,
+        type=_positive_int,
         dest="max_running_req",
         default=ServerArgs.max_running_req,
         help="The maximum number of running requests.",
+    )
+    parser.add_argument(
+        "--max-pending-requests",
+        type=_nonnegative_int,
+        default=ServerArgs.max_pending_requests,
+        help=(
+            "Frontend requests allowed to wait beyond max-running-requests. "
+            "0 preserves serial-engine compatibility capacity (4x running)."
+        ),
     )
 
     parser.add_argument(
@@ -296,6 +467,7 @@ def parse_args(
     assert ServerArgs.use_dummy_weight == False
     parser.add_argument(
         "--dummy-weight",
+        "--use-dummy-weight",
         action="store_true",
         dest="use_dummy_weight",
         help="Use dummy weights for testing.",
@@ -548,6 +720,13 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--kv-reserve-fallback-tokens",
+        type=_positive_int,
+        default=ServerArgs.kv_reserve_fallback_tokens or None,
+        help="Fallback KV token floor when the primary auto-cache floor does not fit.",
+    )
+
+    parser.add_argument(
         "--moe-cache-policy",
         default=ServerArgs.moe_cache_policy,
         choices=["lru"],
@@ -662,6 +841,24 @@ def parse_args(
     # Parse arguments
     kwargs = parser.parse_args(args).__dict__.copy()
 
+    # tinygrad model state is single-request. Use one slot by default for this
+    # device, while preserving an explicit value so invalid configurations fail
+    # before any model/config download work.
+    if kwargs.get("device") == "tinygrad":
+        if not any(flag in args for flag in ("--max-running-requests", "--max-running-req")):
+            kwargs["max_running_req"] = 1
+        if kwargs.get("max_running_req", 1) > 1:
+            raise SystemExit(
+                "--device tinygrad supports --max-running-requests 1 only "
+                "(the tinygrad Transformer is single-request stateful); "
+                "set FT_MAX_RUNNING_REQ=1 or pass --max-running-requests 1."
+            )
+
+    if kwargs.get("max_running_req", 0) < 1:
+        raise SystemExit("--max-running-requests must be >= 1")
+    if kwargs.get("max_pending_requests", 0) < 0:
+        raise SystemExit("--max-pending-requests must be >= 0")
+
     # reject a too-long list here with a clear reason, not as a dead rank later
     if len(kwargs["gpu"]) not in (0, kwargs["tensor_parallel_size"]):
         if kwargs["tensor_parallel_size"] == 1 and len(kwargs["gpu"]) > 1:
@@ -687,11 +884,15 @@ def parse_args(
             os.path.basename(os.path.normpath(kwargs["model_path"])) or kwargs["model_path"]
         )
 
-    if kwargs["tool_call_parser"] == "auto":
+    if kwargs["tool_call_parser"] == "auto" and not kwargs["use_dummy_weight"]:
         kwargs["tool_call_parser"] = _infer_tool_call_parser(kwargs["model_path"])
+    elif kwargs["tool_call_parser"] == "auto":
+        kwargs["tool_call_parser"] = ServerArgs.tool_call_parser
 
-    if kwargs["reasoning_parser"] == "auto":
+    if kwargs["reasoning_parser"] == "auto" and not kwargs["use_dummy_weight"]:
         kwargs["reasoning_parser"] = _infer_reasoning_parser(kwargs["model_path"])
+    elif kwargs["reasoning_parser"] == "auto":
+        kwargs["reasoning_parser"] = ServerArgs.reasoning_parser
     elif kwargs["reasoning_parser"] == "off":
         kwargs["reasoning_parser"] = None
 
@@ -724,7 +925,7 @@ def parse_args(
     # "auto" (or an unspecified dtype) resolves to the checkpoint's dtype. Multimodal /
     # hybrid configs (e.g. Qwen3.5-MoE) keep it under ``text_config`` and use the newer
     # ``dtype`` key rather than top-level ``torch_dtype``, so check both; default bf16.
-    if (dtype_str := kwargs["dtype"]) in ("auto", None):
+    if (dtype_str := kwargs["dtype"]) in ("auto", None) and not kwargs["use_dummy_weight"]:
         from freetoken.utils import cached_load_hf_config
 
         cfg = cached_load_hf_config(kwargs["model_path"]).to_dict()
@@ -734,6 +935,7 @@ def parse_args(
             or text_cfg.get("torch_dtype") or text_cfg.get("dtype") or "bfloat16"
         )
 
+    if dtype_str in ("auto", None): dtype_str = "bfloat16"
     DTYPE_MAP = {
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
@@ -762,14 +964,39 @@ def parse_args(
                 "supported family is offload/hybrid/cpu (the triton/offload path)."
             )
 
-    # --device tinygrad: the tinygrad Transformer is single-request stateful, so
-    # reject max_running_req > 1 at parse time (the runner also asserts).
-    if kwargs.get("device") == "tinygrad" and kwargs.get("max_running_req", 1) > 1:
-        raise SystemExit(
-            "--device tinygrad supports --max-running-requests 1 only "
-            "(the tinygrad Transformer is single-request stateful); "
-            "set FT_MAX_RUNNING_REQ=1 or pass --max-running-requests 1."
-        )
+    if kwargs.get("ple_mode") == "ssd":
+        kwargs["ple_mode"] = "paged"
+    if kwargs.get("qwen38_expert_residency") not in ("ram", "mmap", "auto", "auto-tier"):
+        raise SystemExit("--qwen38-expert-residency must be ram, mmap, auto, or auto-tier")
+    if not isinstance(kwargs.get("qwen38_moe_grouped"), bool):
+        raise SystemExit("--qwen38-moe-grouped must be boolean")
+    if int(kwargs.get("qwen38_moe_scratch_mib", 128)) <= 0:
+        raise SystemExit("--qwen38-moe-scratch-mib must be positive")
+    if kwargs.get("ple_ram_gib", 0) < 0 or kwargs.get("ple_ram_gib", 0) >= 48:
+        raise SystemExit("--ple-ram-gib must be between 0 and 48 GiB with process headroom")
+    from freetoken.engine.host_tier import parse_budget
+    for field in (
+        "ple_ram_cache_mib", "ple_row_cache_mib", "qwen38_host_cache_mib",
+        "qwen38_expert_host_cache_mib",
+    ):
+        try:
+            kwargs[field] = parse_budget(kwargs.get(field, 0), name=field)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+    if kwargs.get("ple_gpu_cache_mib", 0) < 0:
+        raise SystemExit("--ple-gpu-cache-mib must be >= 0")
+    if kwargs.get("ple_staging_mib", 0) < 0:
+        raise SystemExit("--ple-staging-mib must be >= 0")
+    io_depth = kwargs.get("ple_io_depth", 64)
+    if io_depth not in ("auto", "adaptive") and not 1 <= int(io_depth) <= 256:
+        raise SystemExit("--ple-io-depth must be between 1 and 256")
+    depth = kwargs.get("ple_prefetch_depth", 64)
+    if depth != "auto" and not 0 <= int(depth) <= 256:
+        raise SystemExit("--ple-prefetch-depth must be between 0 and 256")
+    if kwargs["sse_heartbeat_s"] >= kwargs["request_timeout_s"]:
+        raise SystemExit("--sse-heartbeat-s must be shorter than --request-timeout-s")
+    if kwargs["ple_probe_timeout_s"] <= 0 or not math.isfinite(kwargs["ple_probe_timeout_s"]):
+        raise SystemExit("--ple-probe-timeout-s must be a positive finite number")
 
     result = ServerArgs(**kwargs)
     logger = init_logger(__name__)

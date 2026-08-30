@@ -22,6 +22,7 @@ JIT notes (mirrors ``Transformer.generate``):
 from __future__ import annotations
 
 import logging
+import os
 import random
 
 import numpy as np
@@ -38,6 +39,11 @@ class TinygradModelRunner:
         max_len: int,
         max_batch: int = 256,
         max_slots: int = 1,
+        ple_store: str | None = None,
+        ple_ram_gib: float = 0.0,
+        ple_workers: int = 2,
+        ple_prefetch: bool = True,
+        ple_mode: str = "auto",
     ) -> None:
         if max_slots > 1:
             raise NotImplementedError(
@@ -55,10 +61,49 @@ class TinygradModelRunner:
         self.max_batch = max_batch
         self.vocab_size = model_config.vocab_size
 
-        self.model, self._kv = Transformer.from_gguf(
-            model_path, max_context=max_context
-        )
+        self._ple_supplier = None
+        self._ple_store = None
+        is_qwen4exp = getattr(model_config, "model_type", "").startswith("qwen4_exp") or "Qwen4Exp" in str(getattr(model_config, "architectures", ""))
+        if is_qwen4exp:
+            is_gguf = model_path.endswith(".gguf") and os.path.isfile(model_path)
+            if is_gguf:
+                if ple_mode not in ("auto",):
+                    raise ValueError(
+                        f"Qwen4-Exp GGUF PLE mode {ple_mode!r} is unsupported on tinygrad; "
+                        "use --device cuda for sidecar/direct GGUF backends"
+                    )
+                self.model, self._kv = Transformer.from_gguf(model_path, max_context=max_context)
+            else:
+              if ple_mode in ("ssd", "paged"):
+                if not ple_store: raise ValueError("Qwen4-Exp SSD mode requires --ple-store")
+                from pathlib import Path
+                from tinygrad.llm.ple_store import PleManifest, PleStore
+                from tinygrad.llm.qwen4exp_ple import SsdPLESupplier
+                manifest_path = Path(ple_store) / "manifest.json" if (Path(ple_store) / "manifest.json").is_file() else Path(ple_store)
+                self._ple_store = PleStore.open(PleManifest.from_file(manifest_path), ram_bytes=int(ple_ram_gib * (1 << 30)), workers=ple_workers)
+                self._ple_supplier = SsdPLESupplier(self._ple_store)
+              self.model = Transformer.from_qwen4exp(model_path, max_context=max_context,
+                                                     ple_supplier=self._ple_supplier,
+                                                     ple_prefetch=ple_prefetch)
+              self._kv = None
+        else:
+            self.model, self._kv = Transformer.from_gguf(model_path, max_context=max_context)
         self._Tensor = Tensor
+        # Qwen4Exp QSA/packed-expert execution currently uses a stateful eager
+        # adapter. It must not enter legacy TinyJit graphs: host-side routing
+        # and bounded expert staging would otherwise be captured with stale
+        # row selections. GDN/QSA device kernels can replace this seam later.
+        self._qwen4exp_direct = bool(is_qwen4exp)
+
+        if self._qwen4exp_direct:
+            self._buf = None
+            self._buf_np = None
+            self._v_sp = self._v_nt = None
+            self._prefill_jit = self._decode_jit = None
+            self._tok_buf = self._Tensor(np.zeros((1, 1), dtype=np.int32)).realize()
+            self._greedy_last_id = None
+            self._active_uid = None
+            return
 
         # JIT specialization: symbolic start_pos + prefill token count, bound at
         # the call site (see module docstring).
@@ -85,6 +130,21 @@ class TinygradModelRunner:
         # latency on this kfd path).
         self._tok_buf = self._Tensor(np.zeros((1, 1), dtype=np.int32)).realize()
         self._greedy_last_id: int | None = None
+        self._active_uid: int | None = None
+
+    def _ensure_request_state(self, uid: int) -> None:
+        """Reset state only when scheduler switches request; preserve continuation chunks."""
+        if self._active_uid == uid:
+            return
+        reset = getattr(self.model, "reset_state", None)
+        if reset is not None:
+            reset()
+        # Qwen4Exp direct mode intentionally skips legacy JIT prompt buffers;
+        # its model owns all recurrent/QSA/PLE state.
+        if self._buf_np is not None:
+            self._buf_np.fill(0)
+        self._greedy_last_id = None
+        self._active_uid = uid
 
     def _warmup(self) -> None:
         """Compile both JIT graphs and realize the weights once at init.
@@ -94,6 +154,7 @@ class TinygradModelRunner:
         prefill chunk + decode at a non-trivial position) so the first request
         doesn't pay a recompile.
         """
+        if self._qwen4exp_direct: return
         warm = np.array([random.randint(0, 1000) for _ in range(256)], dtype=np.int32)
         self._buf_np[0, :256] = warm
         self._buf.assign(self._Tensor(self._buf_np))
@@ -124,6 +185,7 @@ class TinygradModelRunner:
         """
         assert len(batch.reqs) == 1, "tinygrad runner: max_running_req=1 only"
         req = batch.reqs[0]
+        self._ensure_request_state(req.uid)
         cached_len = req.cached_len
         # The scheduler's batch.input_ids is the EXTEND (the prefill chunk or the
         # single decode token), not the full sequence.
@@ -132,6 +194,10 @@ class TinygradModelRunner:
         if n_toks == 0:
             # Empty extend: the scheduler never sends it; return zeros defensively.
             return torch.zeros((1, self.vocab_size), dtype=torch.float32)
+
+        if self._qwen4exp_direct:
+            logits = self.model.logits(self._Tensor(ids.reshape(1, n_toks)), cached_len)
+            return torch.from_numpy(logits.realize().numpy().astype(np.float32))
 
         sp = self._v_sp.bind(cached_len)
         if n_toks == 1:
@@ -162,8 +228,13 @@ class TinygradModelRunner:
         """
         assert len(batch.reqs) == 1, "tinygrad runner: max_running_req=1 only"
         req = batch.reqs[0]
+        self._ensure_request_state(req.uid)
         cached_len = req.cached_len
         ids_host = batch.input_ids.cpu().numpy().astype(np.int32)
+        if self._qwen4exp_direct:
+            if ids_host.size != 1: raise ValueError("Qwen4Exp greedy decode expects one token")
+            logits = self.model.logits(self._Tensor(ids_host.reshape(1, 1)), req.cached_len)
+            return int(logits.realize().numpy().argmax(-1).reshape(-1)[0])
         if self._greedy_last_id is None or int(ids_host[0]) != self._greedy_last_id:
             # first greedy step after a prefill / request switch: re-inject
             self._tok_buf.assign(self._Tensor(ids_host.reshape(1, 1)))
@@ -177,5 +248,25 @@ class TinygradModelRunner:
         return tok_id
 
     def close(self) -> None:
+        if self._ple_store is not None:
+            self._ple_store.close()
         self.model = None
         self._kv = None
+
+    def ple_cache_geometry(self) -> dict:
+        """Host-only PLE status for cache reporting; never synchronizes GPU state."""
+        if self._ple_store is None:
+            return {}
+        stats = self._ple_store.stats()
+        manifest = self._ple_store.m
+        return {
+            "ple_pages": (manifest.rows + manifest.page_rows - 1) // manifest.page_rows,
+            "ple_page_bytes": manifest.row_width * manifest.page_rows,
+            "ple_ram_bytes": self._ple_store.capacity * manifest.row_width * manifest.page_rows,
+            "ple_requested": stats.requested,
+            "ple_hits": stats.hits,
+            "ple_misses": stats.misses,
+            "ple_coalesced": stats.coalesced,
+            "ple_ssd_bytes": stats.ssd_bytes,
+            "ple_sync_wait_ms": stats.wait_ms,
+        }

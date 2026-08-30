@@ -52,6 +52,7 @@ from .generation import (
     submit_generation,
     with_keepalive,
 )
+from .accounting import AdmissionBusyError
 from .request_logger import log_request
 
 # Emit a protocol-native `ping` event after this many seconds of stream silence,
@@ -118,6 +119,8 @@ async def handle_anthropic_messages(
             reasoning_parser=getattr(state.config, "reasoning_parser", None),
         )
         uid = await submit_generation(spec, state)
+    except AdmissionBusyError as exc:
+        return _anthropic_error_response(429, "rate_limit_error", str(exc))
     except ValueError as exc:
         return _anthropic_error_response(400, "invalid_request_error", str(exc))
 

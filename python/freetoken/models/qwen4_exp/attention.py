@@ -121,9 +121,22 @@ class Qwen4ExpAttention(BaseOP):
         self.qo_attn_dim = self.num_q * self.head_dim
         self.kv_attn_dim = self.num_kv * self.head_dim
         self._qkv_split = [self.qo_attn_dim * 2, self.kv_attn_dim, self.kv_attn_dim]
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_split, has_bias=False
-        )
+        self._gguf = getattr(config, "attn_quant", "none") == "gguf"
+        if self._gguf:
+            # Qwen3.8 GGUF stores q|gate as IQ/K-quant type 13 and k|v as
+            # type 14. Each pair has one shared input row geometry, so keep the
+            # pair packed as one projection and split its output. This removes
+            # two quantize/decode launches from every QSA layer in decode.
+            from freetoken.layers.gguf import GGUFLinear
+            from freetoken.models.gguf.dequant import GGML_Q6_K
+
+            self.q_gate_proj = GGUFLinear(config.hidden_size, self.qo_attn_dim * 2, 13)
+            self.kv_proj = GGUFLinear(config.hidden_size, self.kv_attn_dim * 2, GGML_Q6_K)
+            self.q_proj = self.gate_proj = self.k_proj = self.v_proj = None
+        else:
+            self.qkv_proj = LinearColParallelMerged(
+                config.hidden_size, self._qkv_split, has_bias=False
+            )
         self.o_proj = LinearReplicated(self.qo_attn_dim, config.hidden_size, has_bias=False)
         self.q_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaPlusOneRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -139,10 +152,18 @@ class Qwen4ExpAttention(BaseOP):
 
     @nvtx_annotate("QSA")
     def forward(self, x: torch.Tensor, batch: Batch) -> torch.Tensor:
-        qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
-        qg = qg.view(-1, self.num_q, self.head_dim * 2)
-        q = qg[..., : self.head_dim].contiguous()
-        gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
+        if self._gguf:
+            qg = self.q_gate_proj.forward(x).view(-1, self.num_q, self.head_dim * 2)
+            q = qg[..., : self.head_dim].contiguous()
+            gate = qg[..., self.head_dim :].contiguous().view(-1, self.qo_attn_dim)
+            k, v = self.kv_proj.forward(x).split(self.kv_attn_dim, dim=-1)
+            k = k.contiguous().view(-1, self.num_kv, self.head_dim)
+            v = v.contiguous()
+        else:
+            qg, k, v = self.qkv_proj.forward(x).split(self._qkv_split, dim=-1)
+            qg = qg.view(-1, self.num_q, self.head_dim * 2)
+            q = qg[..., : self.head_dim].contiguous()
+            gate = qg[..., self.head_dim :].reshape(-1, self.qo_attn_dim)
         k = k.contiguous().view(-1, self.num_kv, self.head_dim)
         v = v.contiguous()
         self.q_norm.forward_inplace(q)

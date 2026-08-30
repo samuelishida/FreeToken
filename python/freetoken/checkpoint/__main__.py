@@ -10,6 +10,7 @@ fast path (auto-detected).
 from __future__ import annotations
 
 import argparse
+import sys
 import time
 
 import torch
@@ -22,6 +23,19 @@ _DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torc
 
 
 def main(argv: list[str] | None = None, prog: str = "freetoken.checkpoint") -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # Keep conversion CLI stable; PLE build takes explicit local GGUF input only.
+    if argv and argv[0] == "build-ple-store":
+        p = argparse.ArgumentParser(prog=f"{prog} build-ple-store")
+        p.add_argument("--model", required=True, help="first Qwen3.8 GGUF shard")
+        p.add_argument("--out", "--output", dest="out", default=None,
+                       help="output .ftple (default: sibling GGUF)")
+        p.add_argument("--force", action="store_true", help="replace existing sidecar")
+        ns = p.parse_args(argv[1:])
+        from freetoken.models.qwen4_exp.ple_store import build_store
+        output = build_store(ns.model, ns.out, force=ns.force)
+        print(f"PLE sidecar ready -> {output}")
+        return 0
     p = argparse.ArgumentParser(prog=prog, description=__doc__)
     p.add_argument("--model", required=True, help="source HF safetensors checkpoint dir")
     p.add_argument("--out", required=True, help="output FTW checkpoint dir")

@@ -309,6 +309,9 @@ class OffloadMoELayer(MoELayer):
             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+        # ROCm Qwen4 GGUF cache owns one global bounded LRU. Keep global
+        # assignment: its recency view outperforms fixed per-layer partitions
+        # on mixed decode routes, while prefill uses same cache for continuity.
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
         return self._expert_gemm(
@@ -316,7 +319,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -363,7 +366,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             gpu_w,
             gpu_slots,
-            views=cache.bank_views(),
+            views=cache.bank_views(layer_id=self.layer_id),
             n=None,
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
@@ -383,6 +386,43 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        observe = getattr(self, "_status_observer", None)
+        if cache.quant_format == "gguf_qwen4" and self.layer_id in cache._pageable_gpu_layers:
+            # Qwen4 GGUF expert banks are file-backed and pageable. Full-layer
+            # materialization would stream roughly 1 GiB per layer during every
+            # prefill; route only this chunk's selected experts through bounded LRU.
+            # Deduplicate first: flashlib's LRU kernel compares every query pairwise,
+            # so feeding token*top-k routes makes its BLOCK_K^2 scratch explode on
+            # long prefill. The device-side slot map remaps the original route IDs
+            # after the compact LRU call, without a host round-trip.
+            raw_ids = topk_ids
+            valid = raw_ids >= 0
+            unique_ids = torch.unique(raw_ids[valid])
+            if observe is not None:
+                observe("moe_unique_done")
+            remapped = torch.full_like(raw_ids, -1)
+            if unique_ids.numel():
+                cache.ensure_experts(self.layer_id, unique_ids)
+                if observe is not None:
+                    observe("moe_ensure_done")
+                cache.copy_missing()
+                if observe is not None:
+                    observe("moe_copy_done")
+                flat_valid = valid.reshape(-1)
+                remapped.reshape(-1)[flat_valid] = cache.slot_for_id[self.layer_id].index_select(
+                    0, raw_ids.reshape(-1)[flat_valid].long()
+                ).to(dtype=raw_ids.dtype)
+            topk_ids = remapped
+            return self._expert_gemm(
+                cache,
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                views=cache.bank_views(layer_id=self.layer_id),
+                n=None,
+                alphas=cache.alphas_for_slots(self.layer_id),
+                is_prefill=False,
+            )
         if cache.prefill_overlap:
             views = self._wait_prefill_overlap(cache)
             out = self._expert_gemm(
@@ -404,7 +444,7 @@ class OffloadMoELayer(MoELayer):
             hidden_states,
             topk_weights,
             topk_ids,
-            views=cache.bank_views(self.num_experts),
+            views=cache.bank_views(self.num_experts, layer_id=self.layer_id),
             n=self.num_experts,
             alphas=cache.alphas_for_layer(self.layer_id),
             is_prefill=True,
@@ -541,6 +581,62 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "gguf_qwen4":
+            if torch.version.hip is not None and hidden_states.is_cuda:
+                # Native vendored IQ grouped GEMV currently hangs on gfx1100 for
+                # IQ2/IQ3 expert banks.  Keep packed rows in the bounded slot cache,
+                # dequantize only selected rows with the Torch reference decoder,
+                # then use regular batched GEMM (no full-bank expansion).
+                from freetoken.moe.fused_qwen4_gguf import fused_experts_qwen4_gguf
+
+                gate, up, down = views
+                return fused_experts_qwen4_gguf(
+                    hidden_states, gate, up, down, topk_weights, topk_ids,
+                    self.activation, self.layer_id,
+                    grouped=getattr(cache, "qwen38_moe_grouped", True),
+                    scratch_mib=getattr(cache, "qwen38_moe_scratch_mib", 128),
+                )
+            # Qwen4-Exp keeps gate/up as separate IQ banks because layer 2 uses
+            # IQ3_XXS while every other layer uses IQ2_XS.  Use ggml's grouped
+            # vector-MoE kernels directly over the bounded slot cache: no selected
+            # row expansion, Python expert loop, or full-bank dequantization.
+            from freetoken.kernel.gguf import ggml_moe_a8_vec
+            from freetoken.models.gguf.dequant import (
+                GGML_IQ2_XS, GGML_IQ3_XXS, GGML_IQ4_NL,
+            )
+
+            gate, up, down = views
+            gate_type = GGML_IQ3_XXS if self.layer_id == 2 else GGML_IQ2_XS
+            tokens = hidden_states.shape[0]
+            top_k = topk_ids.shape[1]
+            gate_out = ggml_moe_a8_vec(
+                hidden_states, gate, topk_ids, top_k, gate_type,
+                self.intermediate_size, tokens,
+            )
+            up_out = ggml_moe_a8_vec(
+                hidden_states, up, topk_ids, top_k, gate_type,
+                self.intermediate_size, tokens,
+            )
+            from freetoken.layers.activation import (
+                gelu_and_mul, gelu_tanh_and_mul, silu_and_mul,
+            )
+            act_fn = {
+                "silu": silu_and_mul,
+                "swish": silu_and_mul,
+                "gelu": gelu_and_mul,
+                "gelu_tanh": gelu_tanh_and_mul,
+            }.get(self.activation)
+            if act_fn is None:
+                raise ValueError(f"unsupported Qwen4Exp activation {self.activation!r}")
+            inter = act_fn(torch.cat((gate_out, up_out), dim=-1))
+            down_out = ggml_moe_a8_vec(
+                inter, down, topk_ids, 1, GGML_IQ4_NL,
+                self.hidden_size, tokens * top_k,
+            )
+            return (
+                down_out.view(tokens, top_k, self.hidden_size)
+                * topk_weights.view(tokens, top_k, 1).to(down_out.dtype)
+            ).sum(dim=1)
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer

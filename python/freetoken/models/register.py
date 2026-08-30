@@ -17,6 +17,9 @@ class ModelSpec:
 
 
 _MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "Qwen4ExpForConditionalGeneration": ModelSpec(
+        "freetoken.models.qwen4_exp", "Qwen4ExpForCausalLM"
+    ),
     "LlamaForCausalLM": ModelSpec(
         "freetoken.models.llama",
         "LlamaForCausalLM",
@@ -66,13 +69,12 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
-    # Qwen3.8-Flash-Next (model_type qwen4_exp): multimodal wrapper config (text tower in
-    # text_config, weights under model.language_model.); served text-only. 36 GDN + 12 QSA
-    # compressed-sparse attention layers on 4 hyper-connection residual streams, a PLE
-    # n-gram embedding layer, 512 NVFP4 routed experts top-10 + a gated shared expert.
-    "Qwen4ExpForConditionalGeneration": ModelSpec(
-        "freetoken.models.qwen4_exp",
+    # GGUF Qwen3.8-Flash-Next path: native GGUF config and indexed split-shard weights.
+    "Qwen4ExpGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen4_exp.gguf",
         "Qwen4ExpForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
     ),
     # Dense Qwen3.x (no "Moe" in the arch name, num_experts==0, e.g. Qwen3.6-27B). Shares the
     # qwen3_5_moe package: the decoder routes its MLP through the dense Qwen3_5DenseMLP and the

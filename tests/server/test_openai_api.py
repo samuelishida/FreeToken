@@ -16,6 +16,7 @@ from freetoken.server.openai_api import (
     register_openai_routes,
     stream_chat_completion_chunks,
 )
+from freetoken.server.generation import RequestDeadline
 
 
 def run(coro):
@@ -446,6 +447,27 @@ def test_models_route_publishes_the_model_context_length():
 
 async def _collect(generator):
     return [chunk async for chunk in generator]
+
+
+def test_stream_timeout_emits_choices_for_copilot_compatibility():
+    """A post-header timeout must remain parseable by clients requiring ``choices``."""
+    state = FakeState([])
+    deadline = RequestDeadline(timeout_s=0.001, started_at=0.0)
+    events = parse_sse(
+        run(
+            _collect(
+                stream_chat_completion_chunks(
+                    42, chat_request(stream=True, tools=None), state, deadline=deadline
+                )
+            )
+        )
+    )
+
+    terminal = next(event for event in events if isinstance(event, dict) and "error" in event)
+    assert terminal["choices"][0]["finish_reason"] == "length"
+    assert terminal["choices"][0]["delta"]["content"].startswith("[FreeToken]")
+    assert terminal["error"]["code"] == "request_timeout"
+    assert events[-1] == "[DONE]"
 
 
 # --------------------------------------------------------------- dsv4 reasoning

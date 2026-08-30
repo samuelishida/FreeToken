@@ -19,6 +19,7 @@ import glob
 import os
 import threading
 from dataclasses import dataclass, field
+from typing import Protocol, Sequence
 
 import torch
 
@@ -28,8 +29,47 @@ from .offload_cache import _BANK_BYTES_PER_EXPERT, _BANK_SCHEMAS
 
 logger = init_logger(__name__)
 
+
+class ExpertSourceProvider(Protocol):
+    """Bounded packed source seam consumed by :class:`OffloadMoeCache`."""
+
+    host_cache_bytes: int
+
+    def read_experts(
+        self,
+        layer: int,
+        ids: Sequence[int],
+        *,
+        cache_bytes: int = 0,
+        pin_memory: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        ...
+
 # the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 _PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
+
+
+@dataclass(frozen=True)
+class ExpertHostFootprint:
+    """Metadata-only footprint for quantized routed expert banks.
+
+    ``per_bank_bytes`` is totals by bank name; ``per_layer_bytes`` keeps the
+    same geometry available to callers doing layer-wise admission.  Values are
+    packed bytes, never a dequantized dtype estimate.
+    """
+
+    quant_format: str
+    per_bank_bytes: dict[str, int]
+    per_layer_bytes: tuple[dict[str, int], ...]
+    total_packed_bytes: int
+    alignment: int
+    source_fingerprint: str
+    headroom_bytes: int = 0
+
+    @property
+    def total_bytes(self) -> int:
+        """Compatibility alias used by budget/status consumers."""
+        return self.total_packed_bytes
 
 
 @dataclass(frozen=True)
@@ -49,6 +89,30 @@ class ExpertBanks:
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
     streamed: bool = False
+    # Host source policy is deliberately separate from HostResidency.  ``pageable``
+    # is a valid transport label for resident anonymous RAM and does not imply mmap.
+    source_policy: str = "pinned"
+    footprint: ExpertHostFootprint | None = None
+    # Optional bounded source provider used by file-backed Qwen GGUF tiers.
+    # Tensor-only formats leave this unset and keep existing behavior.
+    source_provider: ExpertSourceProvider | None = field(default=None, compare=False, repr=False)
+    # Optional owner for source descriptors (for example a GGUF mmap source).  The
+    # engine/model owns this hook and closes it during shutdown.
+    owner: object | None = field(default=None, compare=False, repr=False)
+
+    def close(self) -> None:
+        """Close owned source descriptors exactly once when they have one."""
+        # File-backed Qwen banks are mmap views retained in ``sources``.  Drop
+        # every exported view before closing the mmap owner; otherwise Python
+        # raises BufferError during normal engine shutdown.
+        for values in self.sources.values():
+            values.clear()
+        owner = self.owner
+        if owner is None:
+            return
+        close = getattr(owner, "close", None)
+        if close is not None:
+            close()
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -321,7 +385,7 @@ _PROVIDERS = {
 }
 
 
-def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk, decode_target="gpu", layer_sink=None, residency=None) -> ExpertBanks:
     """Dispatch to the model's setup-override or the per-quant provider. ``parallel=True``
     is the parallel read; a provider that hasn't implemented it raises NotImplementedError (the
     caller falls back to serial). ``decode_target`` lets the cpu backend force CPU-readable
@@ -347,6 +411,8 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             kw["decode_target"] = decode_target
         if "layer_sink" in params and layer_sink is not None:
             kw["layer_sink"] = layer_sink
+        if "residency" in params and residency is not None:
+            kw["residency"] = residency
         return setup(model_path, model_config, **kw)
 
     expert_quant = model_config.expert_quant
@@ -435,6 +501,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    residency: str | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -500,13 +567,13 @@ def load_expert_banks(
     with requested_residency(layer_residency) as residency_plan:
         try:
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel, workers, chunk,
-                                        decode_target, layer_sink)
+                                        decode_target, layer_sink, residency)
         except NotImplementedError as exc:
             if not parallel:
                 raise
             logger.warning_rank0(f"parallel reader unavailable ({exc}); falling back to serial build")
             banks = _build_expert_banks(model_path, model_config, device, dtype, dummy, False, workers, chunk,
-                                        decode_target, layer_sink)
+                                        decode_target, layer_sink, residency)
     return _echo_residency(banks, layer_residency, residency_plan)
 
 

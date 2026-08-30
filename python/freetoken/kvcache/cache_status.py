@@ -191,6 +191,87 @@ def compute_cache_status_meta(engine: "Engine") -> Dict[str, Any]:
     Best-effort/total -- each piece independently degrades to 0/{} and this never raises
     (it runs on readiness)."""
     meta: Dict[str, Any] = dict(compute_cache_unit_bytes(engine))
+    native = getattr(engine, "qwen4exp_engine", None)
+    if native is not None:
+        # Native Qwen4-Exp owns packed expert/PLE residency instead of the
+        # generic KV/MoE pools. Keep these fields additive for old clients.
+        report = native.memory_report()
+        meta["native_qwen4exp"] = True
+        meta["native_qwen4exp_cache"] = report.get("expert_cache", {})
+        meta["native_qwen4exp_packed"] = report.get("packed_source", {})
+    # Publish source policy separately from destination residency. A generic
+    # ``gpu_resident`` model claim hid file-backed expert/PLE sources.
+    model = getattr(engine, "model", None)
+    ple_table = getattr(model, "_ple_table", None)
+    # Keep source residency explicit.  Expert slot cache destination (VRAM) is
+    # independent from host source policy (anonymous RAM vs mmap/file-backed).
+    banks = getattr(engine, "_expert_banks", None)
+    if banks is not None:
+        footprint = getattr(banks, "footprint", None)
+        meta["expert_host_bytes"] = int(getattr(footprint, "total_packed_bytes", 0) or 0)
+        meta["expert_headroom_bytes"] = int(getattr(footprint, "headroom_bytes", 0) or 0)
+        meta["expert_source_policy"] = getattr(banks, "source_policy", "unknown")
+        meta["storage"] = {
+            "dense_tensors": {
+                "source_policy": "bounded_host_staging_to_gpu",
+                "destination": "gpu_resident",
+            },
+            "expert_banks": {
+                "source_policy": getattr(banks, "source_policy", "unknown"),
+                "destination": "gpu_expert_slot_lru",
+                "host_bytes": int(getattr(footprint, "total_packed_bytes", 0) or 0),
+                "headroom_bytes": int(getattr(footprint, "headroom_bytes", 0) or 0),
+                "fingerprint": getattr(footprint, "source_fingerprint", None),
+                "host_cache": (
+                    getattr(getattr(banks, "source_provider", None), "expert_cache", None).report()
+                    if getattr(getattr(banks, "source_provider", None), "expert_cache", None) is not None
+                    else None
+                ),
+            },
+            "swap_backed": False,
+        }
+    if ple_table is not None:
+        try:
+            ple = ple_table.report()
+            # Keep legacy nested shape while preserving expert topology already
+            # installed above. PLE source policy comes from backend report.
+            storage = meta.setdefault("storage", {"swap_backed": False})
+            storage["ple"] = ple
+            storage.setdefault("dense_tensors", {
+                "source_policy": "bounded_host_staging_to_gpu",
+                "destination": "gpu_resident",
+            })
+            meta["ple_host_bytes"] = int(getattr(ple_table, "host_bytes", 0) or 0)
+            meta["ple_device_bytes"] = int(getattr(ple_table, "device_bytes", 0) or 0)
+            meta["ple_host_reservation_bytes"] = int(
+                getattr(engine, "_ple_host_reserve_bytes", 0)
+                or getattr(ple_table, "host_bytes", 0)
+                or 0
+            )
+            meta["ple_geometry"] = {
+                "mode": ple.get("mode"),
+                "sidecar": ple.get("sidecar"),
+                "ram_budget_bytes": int(ple.get("ram_budget_bytes", 0) or 0),
+                "row_cache_budget_bytes": int(ple.get("row_cache_budget_bytes", 0) or 0),
+                "row_cache_resident_bytes": int(ple.get("row_cache_resident_bytes", 0) or 0),
+                "gpu_budget_bytes": int(ple.get("gpu_budget_bytes", 0) or 0),
+                "staging_budget_bytes": int(ple.get("staging_budget_bytes", 0) or 0),
+            }
+        except Exception:  # noqa: BLE001 -- telemetry must never block readiness
+            pass
+    tier = getattr(engine, "_qwen38_host_tier", None)
+    if tier is not None:
+        try:
+            meta["qwen38_host_tier"] = tier.report()
+            meta.setdefault("storage", {}).setdefault("host_cache", {
+                "shared_bytes": tier.shared_bytes,
+                "expert_bytes": tier.expert_bytes,
+                "ple_page_bytes": tier.ple_page_bytes,
+                "ple_row_bytes": tier.ple_row_bytes,
+                "staging_bytes": tier.staging_bytes,
+            })
+        except Exception:  # noqa: BLE001 -- telemetry must never block readiness
+            pass
     meta["free_vram_bytes"] = _pool_budget_free_vram_bytes(engine)
     meta["floors"] = compute_cache_floors(engine)
     meta["pools"] = compute_cache_pools(engine)

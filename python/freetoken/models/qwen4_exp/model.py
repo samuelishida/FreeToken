@@ -16,17 +16,21 @@ immediate combine::
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, List
+import os
+import time
 
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.layers import BaseOP, OPList, ParallelLMHead, VocabParallelEmbedding
 from freetoken.models.blocks import BaseLLMModel
-from freetoken.utils import nvtx_annotate
+from freetoken.utils import init_logger, nvtx_annotate
 
 from .attention import Qwen4ExpAttention
 from .hc import GatedResidual
 from .moe import Qwen4ExpMoE
 from .ple import PLELayer
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from freetoken.core import Batch
@@ -74,25 +78,47 @@ class Qwen4ExpDecoderLayer(BaseOP):
 
     @nvtx_annotate("Layer_{}", layer_id_field="_layer_id")
     def forward(self, hidden: torch.Tensor, batch: Batch) -> torch.Tensor:
+        observe = getattr(self, "_status_observer", None)
         if self.ple is not None:
             hidden = hidden + self.ple.forward(hidden, batch)
+            if observe is not None:
+                observe("ple_layer_done")
         block_input, inject = self.attn_hyper_connection.mix(hidden)
+        if observe is not None:
+            observe("attn_hc_mix_done")
         if self._is_linear:
             block_output = self.linear_attn.forward(block_input)
         else:
             block_output = self.self_attn.forward(block_input, batch)
+        if observe is not None:
+            observe("attention_done")
         hidden = self.attn_hyper_connection.combine(hidden, block_output, inject)
+        if observe is not None:
+            observe("attn_hc_combine_done")
         block_input, inject = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(hidden, self.mlp.forward(block_input), inject)
+        if observe is not None:
+            observe("mlp_hc_mix_done")
+        self.mlp._status_observer = observe
+        moe_output = self.mlp.forward(block_input)
+        if observe is not None:
+            observe("moe_done")
+        result = self.mlp_hyper_connection.combine(hidden, moe_output, inject)
+        if observe is not None:
+            observe("mlp_hc_combine_done")
+        return result
 
 
 class Qwen4ExpModel(BaseOP):
     def __init__(self, config: ModelConfig) -> None:
         self.hc_count = config.qwen4_args.hc_count
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+        if getattr(config, "dense_quant", "none") == "gguf":
+            from freetoken.layers.gguf import GGUFEmbedding
+            self.embed_tokens = GGUFEmbedding(config.vocab_size, config.hidden_size, 13)
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [Qwen4ExpDecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
@@ -106,16 +132,50 @@ class Qwen4ExpModel(BaseOP):
         return list(self._ple)
 
     def forward(self, input_ids: torch.Tensor, batch: Batch) -> torch.Tensor:
+        table = self._ple[0].ple_embedding.table if self._ple else None
+        mark_forward = getattr(table, "mark_forward", None)
+        emit_stage = None
+        if mark_forward is not None:
+            # Count entry before embedding/repeat.  A synchronous backend failure here
+            # must still be visible as an entered forward in live diagnostics.
+            mark_forward()
+            emit_stage = getattr(table, "_emit_status", None)
+            if emit_stage is not None:
+                emit_stage("model_started")
         hidden = self.embed_tokens.forward(input_ids).repeat(1, self.hc_count)
+        if mark_forward is not None and emit_stage is not None:
+            emit_stage("embedding_done")
         meta = None
         if self._ple:
             from .ple import build_ple_metadata, commit_ngram_context
 
             meta = build_ple_metadata(batch, self._ple[0].args, input_ids.device)
-            for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
-                ple.start_prefetch(batch, meta)
+            if emit_stage is not None:
+                emit_stage("ple_meta_done")
+        for ple in self._ple:  # gather the pinned-host PLE rows while the early layers run
+            ple.start_prefetch(batch, meta)
+        if emit_stage is not None and self._ple:
+            emit_stage("ple_prefetch_done")
+        layer_timing = (
+            os.environ.get("FREETOKEN_QWEN38_LAYER_TIMING", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ) and hidden.is_cuda
         for layer in self.layers.op_list:
+            layer_start = time.perf_counter() if layer_timing else 0.0
+            layer._status_observer = emit_stage
+            if emit_stage is not None:
+                emit_stage(f"layer_{layer._layer_id}_started")
             hidden = layer.forward(hidden, batch)
+            if layer_timing:
+                torch.cuda.synchronize(hidden.device)
+                logger.info(
+                    "Qwen3.8 layer timing: layer=%d kind=%s elapsed_ms=%.2f",
+                    layer._layer_id,
+                    "linear" if layer._is_linear else "qsa",
+                    (time.perf_counter() - layer_start) * 1000.0,
+                )
+            if emit_stage is not None:
+                emit_stage(f"layer_{layer._layer_id}_done")
         if meta is not None:
             # single writer: the layers only read the context, so a second PLE layer's
             # prefetch sees the un-rolled window
@@ -126,6 +186,7 @@ class Qwen4ExpModel(BaseOP):
 class Qwen4ExpForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig) -> None:
         self._config = config
+        self._ple_table = None
         self.model = Qwen4ExpModel(config)
         if getattr(config, "lm_head_quant", "none") == "nvfp4":
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -134,6 +195,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
+        elif getattr(config, "lm_head_quant", "none") == "gguf":
+            from freetoken.layers.gguf import GGUFLinear
+            from freetoken.models.gguf.dequant import GGML_Q4_K
+            self.lm_head = GGUFLinear(config.hidden_size, config.vocab_size, GGML_Q4_K)
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,
@@ -142,6 +207,10 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+        from .gguf import convert_qwen4exp_to_gguf, is_gguf_model
+
+        if is_gguf_model(config):
+            convert_qwen4exp_to_gguf(self, config)
 
     def load_host_tables(self, engine_config) -> int:
         """Attach the PLE n-gram table (pinned checkpoint bank, or zeros for dummy weights); returns the pinned host bytes the engine reserves from its pin budget."""
@@ -169,6 +238,17 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 emb.attach_table(ZeroTable(offsets[-1] + sizes[-1], args.ngram_head_dim))
             return 0
 
+        if getattr(self._config, "moe_weight_format", None) == "gguf":
+            from .gguf import load_gguf_ple_table
+
+            table = load_gguf_ple_table(engine_config.model_path, engine_config)
+            self._ple_table = table
+            for ple in ple_layers:
+                ple.ple_embedding.attach_table(table)
+            # Paged `.ftple` RAM cache is pageable. Reserve only genuinely pinned
+            # staging against the MoE host-registration quota.
+            return int(getattr(table, "pinned_host_bytes", table.host_bytes))
+
         from .weight import load_ple_table
 
         table = load_ple_table(engine_config.model_path, self._config.qwen4_args)
@@ -178,6 +258,51 @@ class Qwen4ExpForCausalLM(BaseLLMModel):
                 PinnedUVATable(table.bank.tensor, float(table.weight_scale))
             )
         return table.bank.nbytes
+
+    def close_host_tables(self) -> None:
+        """Release model-owned PLE file descriptors, workers, and host storage."""
+        table = self._ple_table
+        if table is None:
+            return
+        self._ple_table = None
+        close = getattr(table, "close", None)
+        if close is not None:
+            close()
+
+    def validate_ple_runtime(self, device: torch.device | None = None) -> dict:
+        """Run one real packed-row PLE lookup through the attached backend.
+
+        This deliberately does not synchronize the device; the Engine owns the single startup
+        synchronization so a bad GPU kernel fails before readiness instead of on first request.
+        """
+        table = self._ple_table
+        if table is None:
+            return {"state": "skipped", "reason": "no PLE table"}
+        rows = int(getattr(table, "num_rows", 0) or 0)
+        if rows <= 0:
+            raise RuntimeError("PLE table has no rows")
+        target = device or getattr(table, "_device", None) or torch.device("cpu")
+        # Keep a singleton head dimension: table lookup preserves ``row_ids.shape[:-1]``
+        # and appends the 160-value embedding width.
+        row_ids = torch.zeros((1, 1), dtype=torch.int64, device=target)
+        try:
+            values = table.lookup(row_ids)
+            if tuple(values.shape) != (1, 160):
+                raise RuntimeError(f"PLE probe returned shape {tuple(values.shape)}, expected (1, 160)")
+        except Exception as exc:  # noqa: BLE001 - add model/backend context before startup abort
+            mode = getattr(table, "_report", {}).get("mode", "unknown")
+            raise RuntimeError(
+                f"Qwen4Exp PLE probe failed for {getattr(self._config, 'model_path', '<model>')} "
+                f"(mode={mode}, quant=IQ4_NL, row_bytes=90, row_values=160): {exc}"
+            ) from exc
+        return {
+            "state": "ok",
+            "backend": getattr(table, "_report", {}).get("backend", type(table).__name__),
+            "mode": getattr(table, "_report", {}).get("mode"),
+            "row_values": 160,
+            "row_bytes": 90,
+            "device": str(target),
+        }
 
     def forward(self) -> torch.Tensor:
         batch = get_global_ctx().batch

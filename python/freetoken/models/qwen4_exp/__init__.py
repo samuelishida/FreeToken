@@ -17,12 +17,20 @@ from .weight import (
     load_nvfp4_expert_sources_parallel,
     load_ple_table,
 )
+from .gguf import (
+    estimate_gguf_expert_host_bytes,
+    is_gguf_model,
+    load_gguf_expert_sources,
+    parse_gguf_config,
+    resolve_gguf_expert_residency,
+    setup_offload_expert_banks,
+)
+from .ple_gguf import estimate_gguf_ple_host_bytes
 
 # Official FP8 checkpoints share qwen3_5_moe's block-fp8 expert layout (same
 # model.language_model.layers.* keys), so reuse its bank hook; for every other
 # expert_quant it defers to the per-quant providers, which resolve this module's
 # load_nvfp4_expert_sources via the model spec.
-from freetoken.models.qwen3_5_moe.weight import setup_offload_expert_banks
 
 __all__ = [
     "Qwen4ExpForCausalLM",
@@ -30,6 +38,12 @@ __all__ = [
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "load_ple_table",
+    "parse_gguf_config",
+    "is_gguf_model",
+    "load_gguf_expert_sources",
+    "estimate_gguf_expert_host_bytes",
+    "estimate_gguf_ple_host_bytes",
+    "resolve_gguf_expert_residency",
     "parse_config",
     "setup_offload_expert_banks",
 ]

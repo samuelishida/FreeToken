@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -13,6 +14,9 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # (kept for A/B profiling). Falls back to per-bank automatically if a bank's row bytes or
 # base address are not 16-byte aligned.
 _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
+_FUSED_PAGEABLE_SCATTER = os.getenv("FREETOKEN_FUSED_PAGEABLE_SCATTER", "1").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
@@ -49,6 +53,7 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # down re-quantized to Q8_0 [L*E, H, row_bytes(I,Q8_0)] (a uniform format the cache
     # can hold; the source GGUF down is Q5_K/Q6_K, both >= ... 8-bit >= source precision).
     "gguf": ("gate_up", "down"),
+    "gguf_qwen4": ("gate", "up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -99,6 +104,7 @@ _BANK_BYTES_PER_EXPERT = {
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
     # gate_up Q4_K row_bytes(H, Q4_K)=H//256*144; down Q8_0 row_bytes(I, Q8_0)=I//32*34.
     "gguf": lambda H, I: 2 * I * (H // 256) * 144 + H * (I // 32) * 34,
+    "gguf_qwen4": lambda H, I: 2 * I * (H // 256) * 98 + H * (I // 32) * 18,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
@@ -150,12 +156,26 @@ class OffloadMoeCache:
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
     hybrid_fetch_fraction: float = 0.0
+    # Qwen3.8 GGUF grouped routed-MoE controls. ``grouped=False`` is the
+    # bounded batched-Torch rollback; serving never falls back to primitive
+    # per-expert execution. Scratch is selected-row dense workspace, not bank
+    # residency, and is accounted by the engine's MoE cache budget.
+    qwen38_moe_grouped: bool = True
+    qwen38_moe_scratch_mib: int = 128
 
     def __post_init__(self) -> None:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
         assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
+        if not isinstance(self.qwen38_moe_grouped, bool):
+            raise ValueError("qwen38_moe_grouped must be a boolean")
+        if (
+            isinstance(self.qwen38_moe_scratch_mib, bool)
+            or not isinstance(self.qwen38_moe_scratch_mib, int)
+            or self.qwen38_moe_scratch_mib <= 0
+        ):
+            raise ValueError("qwen38_moe_scratch_mib must be a positive integer")
         # Attached by the engine for decode_target == "cpu" (CpuMoeExecutor); None
         # for the GPU decode path.
         self.cpu_executor = None
@@ -194,6 +214,9 @@ class OffloadMoeCache:
         self.evict_slots = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.src_indices = torch.empty((plan_slots,), dtype=torch.int32, device=self.device)
         self.num_indices = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        # Host mirror for ROCm-safe Qwen routing. Avoid scalar device reads when
+        # sizing the tiny source-ID staging transfer.
+        self._pending_num_indices_host = 0
         # hybrid only: full missing count BEFORE the per-step fetch cap (num_indices holds
         # the capped count that copy_missing actually fetches). The difference is what the
         # CPU computes this step. Written by the hybrid ensure kernel.
@@ -215,6 +238,10 @@ class OffloadMoeCache:
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
+        self._pageable_gpu_layers: frozenset = frozenset()
+        # Optional file-backed expert provider.  Tensor-only formats leave this
+        # unset; Qwen auto-tier uses it to avoid mmap page-fault storms.
+        self.source_provider = None
         # marlin/b12x per-expert global scales ([L*E], GPU resident, see set_alphas).
         self.gate_up_alpha: torch.Tensor | None = None
         self.down_alpha: torch.Tensor | None = None
@@ -268,6 +295,11 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        # Pageable Qwen4 rows use pinned descriptor staging. The worker waits for the
+        # device-side LRU output event, then converts IDs on CPU off the decode thread.
+        self._pageable_copy_executor: ThreadPoolExecutor | None = None
+        self._pageable_src_host: torch.Tensor | None = None
+        self._pageable_count_host: torch.Tensor | None = None
         # Per-bank [2, num_experts, ...] double-buffer views over the slot cache's
         # first 2 * num_experts slots (set up when prefill_overlap is enabled).
         self.prefill_bank_buffers: list[torch.Tensor] = []
@@ -295,6 +327,7 @@ class OffloadMoeCache:
         self,
         sources: dict[str, list[torch.Tensor]],
         layer_residency: list[str] | None = None,
+        provider=None,
     ) -> None:
         """Attach the host (CPU pinned) expert source banks and allocate a GPU slot
         cache per bank, following the format's bank schema.
@@ -311,6 +344,8 @@ class OffloadMoeCache:
         """
         from freetoken.moe.host_banks import HostResidency
 
+        self.source_provider = provider
+
         assert set(sources) == set(self.bank_schema), (
             f"banks {sorted(sources)} do not match the {self.quant_format!r} "
             f"schema {self.bank_schema}"
@@ -320,10 +355,15 @@ class OffloadMoeCache:
         unpinned = frozenset(
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
-        if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+        pageable_gpu = frozenset(
+            i for i, r in enumerate(residency)
+            if r == HostResidency.PAGEABLE.value and self.quant_format == "gguf_qwen4"
+        )
+        cpu_unpinned = unpinned - pageable_gpu
+        if cpu_unpinned:
+            if not cpu_unpinned <= self.cpu_layer_ids:
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
+                    f"non-pinned layers {sorted(cpu_unpinned - self.cpu_layer_ids)} are not in "
                     f"cpu_layer_ids: a layer without a device address can only decode on "
                     f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
                 )
@@ -332,25 +372,33 @@ class OffloadMoeCache:
                     "prefill overlap DMAs from registered banks; it must be disabled "
                     "when any layer is LOCKED/PAGEABLE (the engine does this)"
                 )
-        self._unpinned_layers = unpinned
+        self._unpinned_layers = cpu_unpinned
+        self._pageable_gpu_layers = pageable_gpu
         self.layer_residency = list(residency)
         for name in self.bank_schema:
             per_layer = sources[name]
             assert len(per_layer) == self.num_layers, (name, len(per_layer))
             head = per_layer[0]
+            variable = self.quant_format == "gguf_qwen4"
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                assert source.shape == head.shape and source.dtype == head.dtype, (
+                same_geometry = source.shape == head.shape if not variable else source.shape[:-1] == head.shape[:-1]
+                assert same_geometry and source.dtype == head.dtype, (
                     name, layer_id, source.shape, source.dtype,
                 )
             self.bank_sources[name] = list(per_layer)
+            cache_tail = max(source.shape[-1] for source in per_layer) if variable else head.shape[-1]
             self.bank_caches[name] = torch.empty(
+                (self.cache_size, *head.shape[1:-1], cache_tail) if variable else
                 (self.cache_size, *head.shape[1:]),
                 dtype=head.dtype,
                 device=self.device,
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
+        if self._pageable_gpu_layers and self.prefill_overlap:
+            logger.info("Disabling MoE prefill overlap for pageable Qwen4 GGUF banks")
+            self.prefill_overlap = False
         self._build_copy_plan()
         if self.prefill_overlap:
             self._init_prefill_overlap_buffers()
@@ -373,13 +421,15 @@ class OffloadMoeCache:
         self._gather_bank_ids: list[int] = []
         self._gather_dst_ptrs: torch.Tensor | None = None
         self._gather_feat_bytes: torch.Tensor | None = None
-        if not _FUSED_COPY or self.device.type != "cuda" or not self.banks:
+        if not _FUSED_COPY or self.device.type != "cuda" or not self.banks or self._pageable_gpu_layers:
             return
         from freetoken.kernel.pinned import device_ptr
 
         dst_ptrs, feats = [], []
         layer_src_ptrs = [[] for _ in range(self.num_layers)]
         for per_layer, cache in self.banks:
+            if any(source.shape != per_layer[0].shape for source in per_layer):
+                return
             feat = math.prod(per_layer[0].shape[1:]) * per_layer[0].element_size()
             if feat % 16 != 0 or cache.data_ptr() % 16 != 0:
                 return  # leave fused disabled; copy_missing uses the per-bank path
@@ -465,7 +515,10 @@ class OffloadMoeCache:
         # 3. Reallocate the slot cache from the retained host sources.
         for name in self.bank_schema:
             head = self.bank_sources[name][0]
+            variable = self.quant_format == "gguf_qwen4"
+            cache_tail = max(source.shape[-1] for source in self.bank_sources[name]) if variable else head.shape[-1]
             self.bank_caches[name] = torch.empty(
+                (cache_size, *head.shape[1:-1], cache_tail) if variable else
                 (cache_size, *head.shape[1:]), dtype=head.dtype, device=self.device
             )
         self.banks = [(self.bank_sources[n], self.bank_caches[n]) for n in self.bank_schema]
@@ -568,10 +621,19 @@ class OffloadMoeCache:
         hi = lo + self.num_experts
         return self.gate_up_alpha[lo:hi], self.down_alpha[lo:hi]
 
-    def bank_views(self, n: int | None = None) -> tuple[torch.Tensor, ...]:
+    def bank_views(self, n: int | None = None, layer_id: int | None = None) -> tuple[torch.Tensor, ...]:
         """Per-bank cache views in registration order: the full ``[S]`` slot cache
         (decode), or its first ``n`` slots (materialized layer)."""
         assert self.banks, "set_bank_sources must register the banks first"
+        if self.quant_format == "gguf_qwen4":
+            if layer_id is None:
+                raise ValueError("Qwen4 GGUF bank_views requires layer_id")
+            views = []
+            for name, (per_layer, cache) in zip(self.bank_schema, self.banks):
+                width = per_layer[layer_id].shape[-1]
+                view = cache.narrow(-1, 0, width)
+                views.append(view if n is None else view[:n])
+            return tuple(views)
         if n is None:
             return tuple(cache for _, cache in self.banks)
         return tuple(cache[:n] for _, cache in self.banks)
@@ -813,7 +875,12 @@ class OffloadMoeCache:
             self._prefill_buffer_has_release_event[buffer_id] = True
         self._prefill_buffer_released[buffer_id] = True
 
-    def ensure_experts(self, layer_id: int, expert_ids: torch.Tensor) -> None:
+    def ensure_experts(
+        self, layer_id: int, expert_ids: torch.Tensor, *, layer_local: bool = False
+    ) -> None:
+        if torch.version.hip is not None and self.quant_format == "gguf_qwen4":
+            self._ensure_experts_rocm_safe(layer_id, expert_ids, layer_local=layer_local)
+            return
         from freetoken.moe.offload_kernels import ensure_experts
 
         if self.collect_decode_freq:
@@ -824,6 +891,183 @@ class OffloadMoeCache:
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
         ensure_experts(self, layer_id, expert_ids)
+
+    def _ensure_experts_rocm_safe(
+        self, layer_id: int, expert_ids: torch.Tensor, *, layer_local: bool = False
+    ) -> None:
+        """Assign Qwen4 GGUF slots without the ROCm LRU kernel.
+
+        gfx1100 can leave the flashlib LRU launch waiting forever.  Qwen4 GGUF
+        requests are small (at most ``num_experts`` ids), so bounded host metadata
+        bookkeeping is preferable to an unbounded GPU wait; packed rows still move
+        through the normal pageable staging path.
+        """
+        if expert_ids.ndim == 0:
+            expert_ids = expert_ids.reshape(1)
+        if not 0 <= layer_id < self.num_layers:
+            raise IndexError(f"layer id outside [0,{self.num_layers}): {layer_id}")
+
+        # Keep all route metadata on device. ``unique`` is sorted but stable
+        # route order is restored by the caller's original positions; no
+        # Host list/per-route Python loop is not needed on gfx1100.
+        ids = expert_ids.reshape(-1)
+        valid = ids >= 0
+        valid_ids = ids[valid].to(torch.long)
+        if valid_ids.numel() == 0:
+            self.num_indices.zero_()
+            self._pending_num_indices_host = 0
+            self._pending_src_layer = layer_id
+            self._pending_whole_layer = False
+            return
+        if torch.any(valid_ids >= self.num_experts):
+            raise IndexError(f"expert id outside [0,{self.num_experts})")
+        if self.collect_decode_freq:
+            self.decode_freq[layer_id].scatter_add_(
+                0, valid_ids, torch.ones_like(valid_ids, dtype=self.decode_freq.dtype)
+            )
+        unique_ids = torch.unique(valid_ids, sorted=True)
+        current = self.slot_for_id[layer_id].index_select(0, unique_ids).to(torch.int64)
+        missing_mask = current < 0
+        missing_ids = unique_ids[missing_mask]
+        missing_count = int(missing_ids.numel())
+        if missing_count > self.cache_size:
+            raise RuntimeError(
+                f"Qwen4 GGUF route batch has {missing_count} unique experts but "
+                f"MoE slot cache holds {self.cache_size}"
+            )
+
+        # Warm decode fast path: avoid scanning/sorting the full unified slot
+        # pool (and ``isin`` over thousands of entries) when every routed expert
+        # is already resident. This is common after the first few tokens and
+        # used to dominate ROCm host/device launch overhead despite 100% hits.
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        if missing_count == 0:
+            self.num_indices.zero_()
+            self._pending_num_indices_host = 0
+            route_slots = self.slot_for_id[layer_id].index_select(0, valid_ids)
+            next_step = self.step + valid_ids.numel()
+            self.usage.scatter_reduce_(
+                0,
+                route_slots,
+                torch.full_like(route_slots, next_step, dtype=self.usage.dtype),
+                reduce="amax",
+                include_self=True,
+            )
+            self.step.copy_(next_step)
+            remapped = self.slot_for_id[layer_id].index_select(
+                0, ids.clamp_min(0).to(torch.long)
+            )
+            expert_ids.copy_(
+                torch.where(valid, remapped.to(expert_ids.dtype), ids).view_as(expert_ids)
+            )
+            if self.collect_stats:
+                self.stat_calls.add_(1)
+                self.stat_active.add_(valid_ids.numel())
+                self.stat_active_layer[layer_id].add_(valid_ids.numel())
+                self.stat_steps_layer[layer_id].add_(1)
+            return
+
+        # Candidate slots are selected in deterministic order: unused slots
+        # first, then least-recently-used occupied slots. This vectorized
+        # assignment preserves cache semantics while avoiding GPU↔CPU map copies.
+        if layer_local:
+            # Decode-only layer ownership keeps one layer from evicting another
+            # layer's hot routes. Prefill remains global because its chunk can
+            # touch hundreds of experts and uses a different movement path.
+            lo = (layer_id * self.cache_size) // self.num_layers
+            hi = ((layer_id + 1) * self.cache_size) // self.num_layers
+            if hi - lo >= max(16, missing_count):
+                local_slots = torch.arange(lo, hi, device=self.device, dtype=torch.long)
+                free_slots = local_slots[self.id_of_slot[lo:hi] < 0]
+                occupied_slots = local_slots[self.id_of_slot[lo:hi] >= 0]
+            else:
+                free_slots = torch.nonzero(self.id_of_slot < 0, as_tuple=False).reshape(-1)
+                occupied_slots = torch.nonzero(self.id_of_slot >= 0, as_tuple=False).reshape(-1)
+        else:
+            free_slots = torch.nonzero(self.id_of_slot < 0, as_tuple=False).reshape(-1)
+            occupied_slots = torch.nonzero(self.id_of_slot >= 0, as_tuple=False).reshape(-1)
+        # Never evict a slot already needed by this route batch. Without this
+        # protection a tie in usage can evict a current hit before its final
+        # remap, producing a stale row read within the same forward.
+        protected_slots = current[current >= 0]
+        if occupied_slots.numel() and protected_slots.numel():
+            occupied_slots = occupied_slots[
+                ~torch.isin(occupied_slots, protected_slots)
+            ]
+        if occupied_slots.numel():
+            order = torch.argsort(self.usage.index_select(0, occupied_slots), stable=True)
+            occupied_slots = occupied_slots.index_select(0, order)
+        candidates = torch.cat((free_slots, occupied_slots), dim=0)[:missing_count]
+        if candidates.numel() < missing_count and layer_local:
+            # A stale prefill mapping may occupy local slots. Preserve old
+            # correctness by falling back to global evictable slots instead of
+            # indexing a short candidate vector.
+            all_free = torch.nonzero(self.id_of_slot < 0, as_tuple=False).reshape(-1)
+            all_occupied = torch.nonzero(self.id_of_slot >= 0, as_tuple=False).reshape(-1)
+            if all_occupied.numel() and protected_slots.numel():
+                all_occupied = all_occupied[
+                    ~torch.isin(all_occupied, protected_slots)
+                ]
+            if all_occupied.numel():
+                all_occupied = all_occupied.index_select(
+                    0, torch.argsort(self.usage.index_select(0, all_occupied), stable=True)
+                )
+            candidates = torch.cat((all_free, all_occupied), dim=0)[:missing_count]
+        if candidates.numel() < missing_count:
+            raise RuntimeError(
+                f"unable to assign {missing_count} Qwen4 GGUF experts in cache "
+                f"(available slots={candidates.numel()})"
+            )
+        if missing_count:
+            old_ids = self.id_of_slot.index_select(0, candidates).to(torch.long)
+            old_valid = old_ids >= 0
+            if torch.any(old_valid):
+                old_layers = torch.div(old_ids.clamp_min(0), self.num_experts, rounding_mode="floor")
+                old_experts = old_ids.clamp_min(0) % self.num_experts
+                # Advanced indexing/scatter stays device-side; clear only slots
+                # being evicted, then publish new layer-local mapping.
+                self.slot_for_id[old_layers[old_valid], old_experts[old_valid]] = -1
+            self.slot_for_id[layer_id].index_copy_(0, missing_ids, candidates.to(torch.int32))
+            self.id_of_slot.index_copy_(
+                0, candidates, (layer_id * self.num_experts + missing_ids).to(torch.int32)
+            )
+            self.evict_slots[:missing_count].copy_(candidates.to(torch.int32))
+            self.src_indices[:missing_count].copy_(missing_ids.to(torch.int32))
+        self.num_indices.fill_(missing_count)
+        self._pending_num_indices_host = missing_count
+
+        # Stamp all used slots in one device operation. Exact within-step LRU
+        # ordering is unnecessary for routing correctness; deterministic
+        # recency is maintained across scheduler steps.
+        route_slots = self.slot_for_id[layer_id].index_select(0, valid_ids)
+        next_step = self.step + valid_ids.numel()
+        self.usage.scatter_reduce_(
+            0,
+            route_slots,
+            torch.full_like(route_slots, next_step, dtype=self.usage.dtype),
+            reduce="amax",
+            include_self=True,
+        )
+        self.step.copy_(next_step)
+        # Crucial: the safe path must rewrite raw expert IDs to cache slots just
+        # like flashlib's LRU kernel. Leaving raw IDs here reads wrong rows after
+        # first eviction and can produce a seemingly hung/unstable generation.
+        remapped = self.slot_for_id[layer_id].index_select(0, ids.clamp_min(0).to(torch.long))
+        expert_ids.copy_(
+            torch.where(valid, remapped.to(expert_ids.dtype), ids).view_as(expert_ids)
+        )
+        self._pending_src_layer = layer_id
+        self._pending_whole_layer = False
+        if self.collect_stats:
+            self.stat_calls.add_(1)
+            self.stat_active.add_(valid_ids.numel())
+            self.stat_missing.add_(missing_count)
+            self.stat_fetched.add_(missing_count)
+            self.stat_active_layer[layer_id].add_(valid_ids.numel())
+            self.stat_missing_layer[layer_id].add_(missing_count)
+            self.stat_fetched_layer[layer_id].add_(missing_count)
+            self.stat_steps_layer[layer_id].add_(1)
 
     def ensure_experts_hybrid(self, layer_id: int, expert_ids: torch.Tensor) -> None:
         """Capped-fetch LRU for the hybrid backend.
@@ -903,6 +1147,13 @@ class OffloadMoeCache:
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
+        elif torch.version.hip is not None and self.quant_format == "gguf_qwen4":
+            # gfx1100 uses ROCm-safe Python/device metadata path instead of
+            # flashlib LRU kernel, so lru_stats is not populated. Read same
+            # accumulated counters used by hybrid instrumentation.
+            active = int(self.stat_active.item())
+            missing = int(self.stat_missing.item())
+            calls = int(self.stat_calls.item())
         else:
             active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
         fetched = int(self.stat_fetched.item())
@@ -928,7 +1179,9 @@ class OffloadMoeCache:
         lists indexed by MoE-layer id: missing/active experts per step and the realized
         miss_rate (missing/active) -- i.e. how cacheable each layer's routing actually was
         under the running LRU. Reads device tensors once (no per-step host sync)."""
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or (
+            torch.version.hip is not None and self.quant_format == "gguf_qwen4"
+        ):
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()
@@ -995,7 +1248,46 @@ class OffloadMoeCache:
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
-                cache[: self.num_experts].copy_(per_layer[layer_id])
+                source = per_layer[layer_id]
+                cache.narrow(-1, 0, source.shape[-1])[: self.num_experts].copy_(source)
+            return
+        if layer_id in self._pageable_gpu_layers:
+            # Explicit mmap -> host staging -> GPU cache boundary. This path is
+            # used only by Qwen4 GGUF and keeps the full expert bank file-backed.
+            src_ids = self._pageable_source_ids()
+            if src_ids.numel() == 0:
+                return
+            count = src_ids.numel()
+            dst_ids = self.evict_slots[:count].long()
+            staged = []
+            destinations = []
+            provided = None
+            if self.source_provider is not None:
+                provided = self.source_provider.read_experts(
+                    layer_id,
+                    [int(x) for x in src_ids.detach().cpu().tolist()],
+                    cache_bytes=getattr(self.source_provider, "host_cache_bytes", 0),
+                    pin_memory=self.device.type == "cuda",
+                )
+            for bank_name, (per_layer, cache) in zip(self.bank_schema, self.banks):
+                source = per_layer[layer_id]
+                width = source.shape[-1]
+                packed = (provided[bank_name] if provided is not None else
+                          source.index_select(0, src_ids).contiguous())
+                if self.device.type == "cuda" and not packed.is_pinned():
+                    packed = packed.pin_memory()
+                staged.append(packed.to(self.device, non_blocking=True))
+                destinations.append(cache.narrow(-1, 0, width))
+            if self.device.type == "cuda" and _FUSED_PAGEABLE_SCATTER and torch.version.hip is None:
+                from freetoken.moe.offload_kernels import scatter_pageable_qwen4_rows
+
+                scatter_pageable_qwen4_rows(tuple(staged), tuple(destinations), dst_ids)
+            elif self.device.type == "cuda":
+                for source, destination in zip(staged, destinations):
+                    destination.index_copy_(0, dst_ids, source)
+            else:
+                for source, destination in zip(staged, destinations):
+                    destination.index_copy_(0, dst_ids, source)
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
@@ -1017,13 +1309,60 @@ class OffloadMoeCache:
         from freetoken.kernel import fast_index_copy_jit
 
         for per_layer, cache in self.banks:
+            source = per_layer[layer_id]
+            destination = cache
+            if self.quant_format == "gguf_qwen4":
+                destination = cache.narrow(-1, 0, source.shape[-1])
             fast_index_copy_jit(
-                cache,
+                destination,
                 self.evict_slots,
-                per_layer[layer_id],
+                source,
                 self.src_indices,
                 self.num_indices,
             )
+
+    def _pageable_source_ids(self) -> torch.Tensor:
+        """Stage dynamic LRU descriptors without synchronizing the caller stream."""
+        if self.device.type != "cuda":
+            return self.src_indices[: int(self.num_indices.item())].long()
+        # HIP 7.2 on gfx1100 can leave an Event recorded on the inference stream
+        # permanently unsignaled when synchronized from a Python worker thread.
+        # Keep ROCm correctness deterministic until runtime exposes safe cross-thread
+        # event waits; this descriptor is tiny (<= cache_size int32 values), unlike
+        # expert rows, so only metadata crosses synchronously here.
+        if torch.version.hip is not None:
+            count = int(self._pending_num_indices_host)
+            return self.src_indices[:count].to(device="cpu", dtype=torch.int64)
+        slots = self.src_indices.numel()
+        if self._pageable_src_host is None or self._pageable_src_host.numel() != slots:
+            self._pageable_src_host = torch.empty(slots, dtype=torch.int32, pin_memory=True)
+            self._pageable_count_host = torch.empty(1, dtype=torch.int64, pin_memory=True)
+        assert self._pageable_count_host is not None
+        self._pageable_src_host.copy_(self.src_indices, non_blocking=True)
+        self._pageable_count_host.copy_(self.num_indices, non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        if self._pageable_copy_executor is None:
+            self._pageable_copy_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="freetoken-moe-page"
+            )
+        future = self._pageable_copy_executor.submit(
+            self._finish_pageable_ids,
+            self._pageable_src_host,
+            self._pageable_count_host,
+            ready,
+        )
+        return future.result()
+
+    @staticmethod
+    def _finish_pageable_ids(
+        source: torch.Tensor, count: torch.Tensor, ready: torch.cuda.Event
+    ) -> torch.Tensor:
+        ready.synchronize()
+        n = int(count[0])
+        if n <= 0:
+            return torch.empty(0, dtype=torch.int64)
+        return source[:n].to(dtype=torch.int64).clone()
 
 
 def iter_offload_moe_layers(model) -> Iterator:

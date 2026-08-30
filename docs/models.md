@@ -38,5 +38,24 @@ for them; other checkpoints of the same architectures work too.
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
 - DeepSeek-V4 checkpoints must keep the `inference/config.json` subdir — the
   authoritative model args are read from there.
-- Qwen3.8-Flash-Next keeps a 47.7 GiB PLE n-gram table pinned in host RAM.
+- Qwen3.8-Flash-Next GGUF keeps complete packed expert banks file-backed when
+  `auto-tier` resolves on memory-constrained hosts, then retains routed
+  `(layer, expert)` sets in a bounded packed host cache before GPU slot-LRU
+  copies. Complete IQ4_NL PLE stays in its `.ftple` NVMe sidecar; only bounded
+  page/row caches and pinned staging occupy RAM. `mmap` remains compatibility
+  mode; `ram` fails before allocation when banks plus reserves do not fit.
 - Multimodal checkpoints are served text-only.
+# Qwen3.8 Flash-Next
+
+Qwen3.8 Flash-Next GGUF text-only support uses the standard ROCm Engine route:
+
+```bash
+scripts/serve-qwen38-rocm.sh
+```
+
+It loads all split GGUF shards from the first shard path, serves TP=1 and one
+request, and uses QSA Q8 KV storage. The checkpoint supports 131072 context
+tokens; script default is 32768 max sequence with a 1024-token prefill cap
+(live QSA geometry automatically bounds medium/long chunks),
+and auto-cache can fall back to 98304 when that capacity is requested. Tinygrad
+safetensors support remains experimental; see [AMD tinygrad Qwen3.8](amd-tinygrad-qwen38.md).

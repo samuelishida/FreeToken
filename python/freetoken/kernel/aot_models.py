@@ -89,6 +89,10 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
     if fmt == "q4_0":
         # gemma4/gguf.py _q4_0_expert_specs: GGML Q4_0 rows, 32 elems -> 18 bytes
         return {"gate_up": 2 * I * (H // 32 * 18), "down": H * (I // 32 * 18)}
+    if fmt == "gguf":
+        # Qwen3.8 routed gate/up uses IQ2_XS/IQ3_XXS by layer; down uses IQ4_NL.
+        # AOT exposes one conservative bank schema, while runtime keeps exact types.
+        return {"gate_up": 2 * I * (H // 256 * 98), "down": H * (I // 32 * 18)}
     if fmt in ("nvfp4", "nvfp4_marlin", "nvfp4_b12x"):
         # models/nvfp4_banks.py: packed e2m1 pairs + per-16 fp8-e4m3 scales + fp16
         # per-row globals; marlin/b12x repacks are byte-identical with the globals
@@ -149,6 +153,7 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=8,
         moe_intermediate_size=512,
         expert_formats=("bf16",),
+        arch_aliases=("Qwen35moeGGUFForCausalLM",),
     ),
     AotModel(
         name="Qwen/Qwen3.5-35B-A3B-FP8",
@@ -198,6 +203,16 @@ SUPPORTED_MODELS: tuple[AotModel, ...] = (
         top_k=10,
         moe_intermediate_size=640,
         expert_formats=(*_NVFP4_FORMATS, "fp8_block"),
+    ),
+    AotModel(
+        name="Qwen3.8-Flash-Next-UD-Q2_K_XL-GGUF",
+        architecture="Qwen4ExpGGUFForCausalLM",
+        hidden_size=2560,
+        kv_groups=((2, 256),),
+        top_k=10,
+        moe_intermediate_size=640,
+        expert_formats=("gguf",),
+        embed_indexing=False,
     ),
     AotModel(
         name="google/gemma-4-26B-A4B-it",
