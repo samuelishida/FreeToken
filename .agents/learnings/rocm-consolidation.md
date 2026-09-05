@@ -45,3 +45,26 @@ Model-level native/reference parity, graph replay, other physical ROCm targets, 
 ### Reuse
 
 Read before changing `python/freetoken/models/qwen3_5_moe/gguf.py`, `python/freetoken/moe/fused_gguf.py`, `python/freetoken/moe/offload_kernels.py`, or CPU/hybrid bank selection. Preserve exact quant metadata and fail-closed promotion gates.
+
+## 2026-09-05 — GGUF registry and AOT coverage
+
+### Context
+
+Adding a GGUF-only registry architecture exposed an existing test assumption that every registry key must have an AOT shape entry.
+
+### Hardest decision
+
+Declare `Qwen35moeGGUFForCausalLM` as an alias of Qwen3.5 geometry without claiming GGUF expert formats are AOT-supported; mixed native GGUF experts remain on their JIT dispatch path.
+
+### Alternatives rejected
+
+- Add GGUF formats to safetensors AOT bank tables — mixed per-layer rows do not fit one static bank-format entry.
+- Remove registry coverage assertion — hides future unclaimed architecture mistakes.
+
+### Least confident
+
+Future GGUF AOT work may need conservative per-layer byte schemas rather than this geometry-only alias.
+
+### Reuse
+
+When adding registry-only model variants, use `AotModel.arch_aliases` when geometry is shared but weight format and runtime path differ.
