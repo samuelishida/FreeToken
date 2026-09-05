@@ -1,3 +1,0 @@
-rocm-consolidation:
-  file: rocm-consolidation.md
-  description: Read before ROCm, mixed GGUF MoE, target portability, benchmark promotion, or JIT-cache changes.

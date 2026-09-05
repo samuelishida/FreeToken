@@ -384,7 +384,7 @@ def _module():
         source = _CSRC / "gguf_kernel.cu"
         include_paths = [str(_CSRC)]
 
-    # Rows-per-warp for the MMVQ/MoE-vec launches (Inc 4, .plans/rocm-perf-parity).
+    # Rows-per-warp for MMVQ/MoE-vec launches.
     # Overridable for tuning/AB; the JIT cache keys on the cflags, so a changed value
     # rebuilds cleanly. CUDA-side the same -D reaches ggml-common.h's #ifndef guard.
     mmv_y = os.getenv("FREETOKEN_GGUF_MMV_Y", "").strip()
