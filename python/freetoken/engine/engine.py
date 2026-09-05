@@ -34,7 +34,9 @@ logger = init_logger(__name__)
 
 def _cuda_graph_disabled(config: EngineConfig) -> bool:
     return config.cuda_graph_bs == [] or (
-        config.cuda_graph_bs is None and config.cuda_graph_max_bs == 0
+        config.cuda_graph_bs is None
+        and config.cuda_graph_max_bs is not None
+        and config.cuda_graph_max_bs < 1
     )
 
 

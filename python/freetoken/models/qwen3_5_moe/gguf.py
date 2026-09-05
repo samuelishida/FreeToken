@@ -154,26 +154,27 @@ def is_gguf_model(config: ModelConfig) -> bool:
 
 def _gguf_down_quant_types(model_path: str) -> tuple[int, ...]:
     """Read routed down types from tensor headers without touching tensor payloads."""
-    from freetoken.models.gguf.reader import _reader
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
 
     try:
-        reader = _reader(model_path)
+        shards = gguf_shard_paths(model_path)
     except (OSError, ValueError, ImportError):
         return ()
     types: dict[int, int] = {}
-    for tensor in reader.tensors:
-        if not tensor.name.startswith("blk.") or not tensor.name.endswith("ffn_down_exps.weight"):
-            continue
-        layer = int(tensor.name.split(".")[1])
-        quant_type = int(tensor.tensor_type)
-        if quant_type not in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0):
-            raise ValueError(
-                f"{tensor.name}: resident GGUF supports Q4_K/Q5_K/Q6_K/Q8_0 down experts, "
-                f"got ggml type {quant_type}"
-            )
-        prior = types.setdefault(layer, quant_type)
-        if prior != quant_type:
-            raise ValueError(f"{tensor.name}: expert down quant type changed within layer")
+    for shard in shards:
+        for tensor in _reader(shard).tensors:
+            if not tensor.name.startswith("blk.") or not tensor.name.endswith("ffn_down_exps.weight"):
+                continue
+            layer = int(tensor.name.split(".")[1])
+            quant_type = int(tensor.tensor_type)
+            if quant_type not in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0):
+                raise ValueError(
+                    f"{tensor.name}: resident GGUF supports Q4_K/Q5_K/Q6_K/Q8_0 down experts, "
+                    f"got ggml type {quant_type}"
+                )
+            prior = types.setdefault(layer, quant_type)
+            if prior != quant_type:
+                raise ValueError(f"{tensor.name}: expert down quant type changed within layer")
     if not types:
         return ()
     last = max(types)

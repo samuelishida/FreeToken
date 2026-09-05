@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 from freetoken.message import TokenizeMsg, UserReply
 from freetoken.server.openai_api import (
     ChatCompletionRequest,
@@ -111,6 +113,15 @@ def test_openai_penalties_reach_neutral_sampling_params():
     spec = chat_request_to_genspec(req, {})
     assert spec.sampling_params.presence_penalty == 0.4
     assert spec.sampling_params.frequency_penalty == 0.7
+
+
+@pytest.mark.parametrize("field", ["presence_penalty", "frequency_penalty"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 2.01, -2.01])
+def test_openai_requests_reject_invalid_penalties(field, value):
+    with pytest.raises(ValueError, match=field):
+        chat_request(**{field: value})
+    with pytest.raises(ValueError, match=field):
+        CompletionRequest(model="client-model", prompt="hello", **{field: value})
 
 
 def parse_sse(chunks: list[bytes]) -> list[dict | str]:

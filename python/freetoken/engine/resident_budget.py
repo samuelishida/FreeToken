@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import Iterable, Literal
 
 _MIB = 1 << 20
-_GIB = 1 << 30
 GRAPH_RESERVE_BYTES = 768 * _MIB
 MIN_LOAD_SCRATCH_BYTES = 512 * _MIB
 MIN_SAFETY_BYTES = 1_500 * _MIB
@@ -138,24 +137,25 @@ def required_phase_bytes(phases: Iterable[PhaseMemory], safety_bytes: int = 0) -
 
 def _gguf_payload_bytes(model_path: str) -> tuple[int, int]:
     """Return (all packed tensor bytes, largest tensor bytes) from GGUF headers."""
-    from freetoken.models.gguf.reader import _reader
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
 
-    reader = _reader(model_path)
+    shards = gguf_shard_paths(model_path)
     total = 0
     largest = 0
     import gguf
 
-    for tensor in reader.tensors:
-        shape = [int(dim) for dim in tensor.shape]
-        block, type_size = gguf.GGML_QUANT_SIZES[tensor.tensor_type]
-        fastest = shape[0]
-        if fastest % block:
-            raise ValueError(
-                f"{tensor.name}: fastest dimension {fastest} is not a multiple of {block}"
-            )
-        size = math.prod(shape) // block * type_size
-        total += size
-        largest = max(largest, size)
+    for shard in shards:
+        for tensor in _reader(shard).tensors:
+            shape = [int(dim) for dim in tensor.shape]
+            block, type_size = gguf.GGML_QUANT_SIZES[tensor.tensor_type]
+            fastest = shape[0]
+            if fastest % block:
+                raise ValueError(
+                    f"{tensor.name}: fastest dimension {fastest} is not a multiple of {block}"
+                )
+            size = math.prod(shape) // block * type_size
+            total += size
+            largest = max(largest, size)
     return total, largest
 
 

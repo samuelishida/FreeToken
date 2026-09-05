@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Literal, Tuple
@@ -28,6 +29,12 @@ class SamplingParams:
     # OpenAI-style penalties apply to generated tokens only; prompt tokens are excluded.
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
+
+    def __post_init__(self) -> None:
+        for name in ("presence_penalty", "frequency_penalty"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or not -2.0 <= value <= 2.0:
+                raise ValueError(f"{name} must be finite and between -2 and 2")
 
     @property
     def is_greedy(self) -> bool:

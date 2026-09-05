@@ -47,9 +47,18 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
             continue
         if (library_dir / "libamdhip64.so").exists():
             return [str(include_dir)], [str(library_dir)], "amdhip64"
-        versioned = sorted(library_dir.glob("libamdhip64.so.*"))
+        versioned: list[tuple[tuple[int, ...], Path]] = []
+        prefix = "libamdhip64.so."
+        for path in library_dir.glob(f"{prefix}*"):
+            suffix = path.name.removeprefix(prefix)
+            try:
+                version = tuple(int(part) for part in suffix.split("."))
+            except ValueError:
+                continue
+            versioned.append((version, path))
         if versioned:
-            return [str(include_dir)], [str(library_dir)], f":{versioned[-1].name}"
+            _, runtime = max(versioned, key=lambda item: item[0])
+            return [str(include_dir)], [str(library_dir)], f":{runtime.name}"
 
     searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
     raise RuntimeError(

@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -57,6 +58,19 @@ def test_file_identity_and_timing_are_content_based(tmp_path):
     summary = summarize_timings([1, 2, 3], warmup=1)
     assert summary["repeats"] == 2
     assert summary["median_tok_s"] == 2.5
+
+
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+def test_summarize_timings_rejects_nonfinite_values(value):
+    with pytest.raises(ValueError, match="timing values"):
+        summarize_timings([value])
+
+
+def test_manifest_rejects_nonfinite_raw_timing(tmp_path):
+    manifest = _manifest(tmp_path)
+    manifest["timing"]["raw_tok_s"][0] = math.nan
+
+    assert any("raw_tok_s" in reason for reason in validate_manifest(manifest))
 
 
 def test_manifest_contains_route_completion_and_runtime_identity(tmp_path):

@@ -112,15 +112,24 @@ def _rocm_link_flags() -> List[str]:
         unversioned = library_dir / "libamdhip64.so"
         link_dir = library_dir
         if not unversioned.exists():
-            versioned = sorted(library_dir.glob("libamdhip64.so.*"))
+            versioned: list[tuple[tuple[int, ...], pathlib.Path]] = []
+            prefix = "libamdhip64.so."
+            for path in library_dir.glob(f"{prefix}*"):
+                suffix = path.name.removeprefix(prefix)
+                try:
+                    version = tuple(int(part) for part in suffix.split("."))
+                except ValueError:
+                    continue
+                versioned.append((version, path))
             if not versioned:
                 continue
+            _, runtime = max(versioned, key=lambda item: item[0])
             link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib"
             link_dir.mkdir(parents=True, exist_ok=True)
             compat_link = link_dir / "libamdhip64.so"
             if not compat_link.exists() and not compat_link.is_symlink():
                 try:
-                    compat_link.symlink_to(versioned[-1])
+                    compat_link.symlink_to(runtime)
                 except FileExistsError:
                     # Multiple tensor-parallel ranks may prepare the same cache.
                     pass

@@ -56,6 +56,7 @@ def test_non_rocm_keeps_existing_cuda_host_callback_fallback(monkeypatch):
         ([1], 0, False),
         ([], 32, True),
         (None, 0, True),
+        (None, -1, True),
     ],
 )
 def test_rocm_auto_hybrid_requires_graph_to_be_disabled(

@@ -1,9 +1,19 @@
 """Sampling-history contracts used by GGUF/Qwen serving."""
 
+import math
+
+import pytest
 import torch
 
 from freetoken.core import Batch, Req, SamplingParams
 from freetoken.engine.sample import Sampler, apply_penalties
+
+
+@pytest.mark.parametrize("field", ["presence_penalty", "frequency_penalty"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf, 2.01, -2.01])
+def test_sampling_params_reject_invalid_penalties(field, value):
+    with pytest.raises(ValueError, match=field):
+        SamplingParams(**{field: value})
 
 
 def _req(params: SamplingParams, prompt=(10, 11, 10)) -> Req:

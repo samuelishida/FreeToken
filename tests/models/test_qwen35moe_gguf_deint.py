@@ -6,8 +6,10 @@ head order, so the loader de-interleaves the value projections on load. These te
 permutation and the packed/dense de-interleave helpers (no model weights required).
 """
 
-import torch
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 from freetoken.models.qwen3_5_moe.gguf import (
     _gdn_head_perm,
@@ -112,8 +114,10 @@ def test_k_quant_source_requantizes_to_q8_cache_within_tolerance(ggml_type, row_
     assert relative_rmse < 0.01
 
 
-def test_down_quant_type_reader_preserves_mixed_layer_types(monkeypatch):
+def test_down_quant_type_reader_preserves_mixed_layer_types(monkeypatch, tmp_path):
     from freetoken.models.gguf import reader
+    model_path = tmp_path / "synthetic.gguf"
+    model_path.write_bytes(b"synthetic")
 
     class Tensor:
         def __init__(self, name, quant_type):
@@ -121,6 +125,7 @@ def test_down_quant_type_reader_preserves_mixed_layer_types(monkeypatch):
             self.tensor_type = quant_type
 
     class FakeReader:
+        fields = {}
         tensors = [
             Tensor("blk.0.ffn_down_exps.weight", GGML_Q5_K),
             Tensor("blk.1.ffn_down_exps.weight", GGML_Q6_K),
@@ -128,6 +133,38 @@ def test_down_quant_type_reader_preserves_mixed_layer_types(monkeypatch):
         ]
 
     monkeypatch.setattr(reader, "_reader", lambda _path: FakeReader())
-    assert _gguf_down_quant_types("synthetic.gguf") == (
+    assert _gguf_down_quant_types(str(model_path)) == (
         GGML_Q5_K, GGML_Q6_K, GGML_Q5_K
     )
+
+
+def test_down_quant_type_reader_reads_all_split_shards(monkeypatch, tmp_path):
+    from freetoken.models.gguf import reader
+
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    class Field:
+        def contents(self):
+            return 2
+
+    class Tensor:
+        def __init__(self, name, tensor_type):
+            self.name = name
+            self.tensor_type = tensor_type
+
+    readers = {
+        str(first): SimpleNamespace(
+            fields={"split.count": Field()},
+            tensors=[Tensor("blk.0.ffn_down_exps.weight", GGML_Q5_K)],
+        ),
+        str(second): SimpleNamespace(
+            fields={"split.count": Field()},
+            tensors=[Tensor("blk.1.ffn_down_exps.weight", GGML_Q6_K)],
+        ),
+    }
+    monkeypatch.setattr(reader, "_reader", readers.__getitem__)
+
+    assert _gguf_down_quant_types(str(first)) == (GGML_Q5_K, GGML_Q6_K)

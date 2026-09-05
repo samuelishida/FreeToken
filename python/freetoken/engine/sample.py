@@ -74,10 +74,10 @@ class Sampler:
 
     def prepare(self, batch: Batch) -> BatchSamplingArgs:
         params = [r.sampling_params for r in batch.reqs]
-        apply_penalties = any(
+        penalties_enabled = any(
             p.presence_penalty != 0.0 or p.frequency_penalty != 0.0 for p in params
         )
-        if all(p.is_greedy for p in params) and not apply_penalties:
+        if all(p.is_greedy for p in params) and not penalties_enabled:
             return BatchSamplingArgs(temperatures=None)
 
         MIN_P = MIN_T = 1e-6
@@ -94,7 +94,7 @@ class Sampler:
             temperatures,
             top_k=top_k,
             top_p=top_p,
-            apply_penalties=apply_penalties,
+            apply_penalties=penalties_enabled,
         )
 
     @nvtx_annotate("Sampler")

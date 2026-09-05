@@ -117,3 +117,33 @@ def test_resident_budget_is_allocation_free(monkeypatch):
     assert budget.safety_bytes == 1_500 * (1 << 20)
     assert budget.required_bytes > budget.free_bytes
     assert budget.fits is False
+
+
+def test_resident_budget_reads_all_split_gguf_shards(monkeypatch, tmp_path):
+    import gguf
+    from freetoken.engine import resident_budget
+    from freetoken.models.gguf import reader
+
+    first = tmp_path / "model-00001-of-00002.gguf"
+    second = tmp_path / "model-00002-of-00002.gguf"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    quant = next(key for key in gguf.GGML_QUANT_SIZES if int(key) == GGML_Q4_K)
+
+    class Field:
+        def contents(self):
+            return 2
+
+    def make_reader(name):
+        return SimpleNamespace(
+            fields={"split.count": Field()},
+            tensors=[SimpleNamespace(name=name, tensor_type=quant, shape=[256])],
+        )
+
+    readers = {
+        str(first): make_reader("blk.0.ffn_down_exps.weight"),
+        str(second): make_reader("blk.1.ffn_down_exps.weight"),
+    }
+    monkeypatch.setattr(reader, "_reader", readers.__getitem__)
+
+    assert resident_budget._gguf_payload_bytes(str(first)) == (288, 144)

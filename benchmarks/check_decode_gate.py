@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ def evaluate_gate(
     min_runs: int = 3,
     min_gain: float = 0.05,
 ) -> dict[str, Any]:
+    if not math.isfinite(min_gain) or min_gain < 0:
+        raise ValueError("min_gain must be finite and non-negative")
     reasons: list[str] = []
     for label, rows in (("candidate", candidate), ("baseline", baseline)):
         for index, row in enumerate(rows):
@@ -49,8 +52,16 @@ def evaluate_gate(
         reasons.append("candidate and baseline do not share one workload/quant/graph/lane identity")
     candidate_speeds = [row.get("timing", {}).get("median_tok_s") for row in candidate]
     baseline_speeds = [row.get("timing", {}).get("median_tok_s") for row in baseline]
-    candidate_speeds = [float(value) for value in candidate_speeds if isinstance(value, (int, float))]
-    baseline_speeds = [float(value) for value in baseline_speeds if isinstance(value, (int, float))]
+    candidate_speeds = [
+        float(value)
+        for value in candidate_speeds
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+    ]
+    baseline_speeds = [
+        float(value)
+        for value in baseline_speeds
+        if isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+    ]
     candidate_median = statistics.median(candidate_speeds) if candidate_speeds else None
     baseline_median = statistics.median(baseline_speeds) if baseline_speeds else None
     gain = (

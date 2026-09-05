@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -113,8 +114,8 @@ def runtime_identity() -> dict[str, Any]:
 def summarize_timings(values: Iterable[float], *, warmup: int = 0) -> dict[str, Any]:
     raw = [float(value) for value in values]
     measured = raw[max(0, int(warmup)) :]
-    if not measured or any(value <= 0 for value in measured):
-        raise ValueError("timing values after warmup must be positive and non-empty")
+    if not measured or any(not math.isfinite(value) or value <= 0 for value in raw):
+        raise ValueError("timing values must be finite, positive, and non-empty")
     return {
         "warmup": max(0, int(warmup)),
         "raw_tok_s": raw,
@@ -240,10 +241,30 @@ def validate_manifest(value: object) -> list[str]:
             problems.append("timing.lane is unknown")
         if not isinstance(timing.get("repeats"), int) or timing["repeats"] < 1:
             problems.append("timing.repeats must be positive")
-        if not isinstance(timing.get("median_tok_s"), (int, float)) or timing["median_tok_s"] <= 0:
+        if (
+            not isinstance(timing.get("median_tok_s"), (int, float))
+            or not math.isfinite(timing["median_tok_s"])
+            or timing["median_tok_s"] <= 0
+        ):
             problems.append("timing.median_tok_s must be positive")
-        if not isinstance(timing.get("spread"), (int, float)) or timing["spread"] < 0:
+        if (
+            not isinstance(timing.get("spread"), (int, float))
+            or not math.isfinite(timing["spread"])
+            or timing["spread"] < 0
+        ):
             problems.append("timing.spread must be non-negative")
+        raw_timings = timing.get("raw_tok_s")
+        if raw_timings is not None and (
+            not isinstance(raw_timings, list)
+            or not raw_timings
+            or any(
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+                for value in raw_timings
+            )
+        ):
+            problems.append("timing.raw_tok_s must contain finite positive values")
     return problems
 
 

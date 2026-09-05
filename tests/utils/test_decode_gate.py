@@ -1,3 +1,4 @@
+import math
 import sys
 from pathlib import Path
 
@@ -50,3 +51,14 @@ def test_gate_rejects_mixed_lanes(tmp_path):
 def test_gate_rejects_fallback_evidence(tmp_path):
     with pytest.raises(ValueError, match="fallbacks"):
         _rows(tmp_path, [110], fallback=1)
+
+
+def test_gate_rejects_nonfinite_timing(tmp_path):
+    candidate = _rows(tmp_path, [110])
+    candidate[0]["timing"]["median_tok_s"] = math.nan
+
+    result = evaluate_gate(candidate, _rows(tmp_path, [100]))
+
+    assert result["gate"] is False
+    assert any("median_tok_s" in reason for reason in result["reasons"])
+    assert result["gain"] is None

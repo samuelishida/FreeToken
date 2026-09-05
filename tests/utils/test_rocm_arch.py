@@ -90,7 +90,9 @@ def test_rocm_link_flags_support_versioned_modular_sdk(monkeypatch, tmp_path):
     sdk = tmp_path / "sdk"
     library_dir = sdk / "lib"
     library_dir.mkdir(parents=True)
-    versioned_runtime = library_dir / "libamdhip64.so.7"
+    older_runtime = library_dir / "libamdhip64.so.9"
+    versioned_runtime = library_dir / "libamdhip64.so.10"
+    older_runtime.write_bytes(b"")
     versioned_runtime.write_bytes(b"")
     real_find_spec = importlib.util.find_spec
 
