@@ -106,6 +106,13 @@ def chat_request(**kwargs) -> ChatCompletionRequest:
     return ChatCompletionRequest(**payload)
 
 
+def test_openai_penalties_reach_neutral_sampling_params():
+    req = chat_request(presence_penalty=0.4, frequency_penalty=0.7)
+    spec = chat_request_to_genspec(req, {})
+    assert spec.sampling_params.presence_penalty == 0.4
+    assert spec.sampling_params.frequency_penalty == 0.7
+
+
 def parse_sse(chunks: list[bytes]) -> list[dict | str]:
     events: list[dict | str] = []
     for chunk in chunks:

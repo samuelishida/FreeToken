@@ -14,6 +14,22 @@ from flashlib.kernels.slot_cache import N_STATS, Stat
 # base address are not 16-byte aligned.
 _FUSED_COPY = os.getenv("FREETOKEN_FUSED_COPY", "1").strip().lower() not in {"0", "false", "no", "off"}
 
+
+def _hip_graph_capture_active() -> bool:
+    """Return true only while current HIP stream is capturing.
+
+    The fused copy consumes device pointer tables that contain host-bank aliases.
+    HIP graph capture/replay does not guarantee that this indirect table path is
+    replay-safe, so capture uses direct per-bank kernel arguments. CUDA keeps its
+    existing fused path unchanged.
+    """
+    if torch.version.hip is None:
+        return False
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except (AttributeError, RuntimeError):
+        return False
+
 # cudaMemcpyBatchAsync silently degrades to a SYNCHRONOUS copy when a batch mixes
 # large entries with sub-~256KB entries on registered host memory (H100 + CUDA 13.0,
 # empirically bisected: a single 5-22KB entry beside one large entry blocks the
@@ -1001,7 +1017,7 @@ class OffloadMoeCache:
             for per_layer, cache in self.banks:
                 cache[: self.num_experts].copy_(per_layer[layer_id])
             return
-        if self._copy_fused_ok:
+        if self._copy_fused_ok and not _hip_graph_capture_active():
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
             # One launch copies the missing rows for every bank (instead of one launch per

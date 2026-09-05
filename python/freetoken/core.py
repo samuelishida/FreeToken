@@ -25,6 +25,9 @@ class SamplingParams:
     # Stop strings (OpenAI `stop` / Anthropic `stop_sequences`). Generation finishes when one
     # appears in the decoded output; the matched substring (and anything after) is trimmed.
     stop_strs: list[str] = field(default_factory=list)
+    # OpenAI-style penalties apply to generated tokens only; prompt tokens are excluded.
+    presence_penalty: float = 0.0
+    frequency_penalty: float = 0.0
 
     @property
     def is_greedy(self) -> bool:
@@ -40,6 +43,8 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    # Original prompt boundary. input_ids[prompt_len:] is generated history.
+    prompt_len: int = 0
     # Optional precomputed multimodal soft-token embeddings (GPU, [num_image_tokens,
     # hidden]) scattered at image-token positions during this request's prefill.
     mm_embeds: torch.Tensor | None = None
@@ -71,6 +76,7 @@ class Req:
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
         self._alloc_ids_buf()
+        self.prompt_len = self.device_len
 
     def _alloc_ids_buf(self) -> None:
         self._ids_buf = torch.empty(self.max_device_len, dtype=self.input_ids.dtype)

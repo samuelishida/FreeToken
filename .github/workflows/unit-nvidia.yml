@@ -1,0 +1,36 @@
+name: NVIDIA unit and extension gate
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/unit-nvidia.yml"
+      - "setup.py"
+      - "pyproject.toml"
+      - "python/freetoken/kernel/**"
+      - "python/freetoken/utils/arch.py"
+      - "tests/kernels/**"
+      - "tests/utils/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Compile and run focused CUDA-safe tests
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace/FreeToken" \
+            -w /workspace/FreeToken \
+            nvidia/cuda:13.0.0-devel-ubuntu24.04 bash -lc '
+              apt-get update -qq && apt-get install -y -qq python3-pip python3-venv &&
+              python3 -m pip install --break-system-packages --quiet uv &&
+              uv pip install --system --index-url https://download.pytorch.org/whl/cu130 torch==2.11.0 &&
+              uv pip install --system --quiet -e ".[dev]" &&
+              python3 setup.py build_ext --inplace &&
+              python3 -m pytest tests/kernels/test_e4m3_compat.py tests/kernels/test_pinned_tensor.py tests/kernels/test_rocm_launch_kwargs.py tests/kernels/test_norm.py tests/utils/test_rocm_arch.py
+            '

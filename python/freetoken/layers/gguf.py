@@ -13,6 +13,8 @@ TP is assumed to be 1 (the gemma4 GGUF path restricts to TP=1, like the HF path)
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from freetoken.models.gguf.dequant import (
@@ -88,6 +90,93 @@ class GGUFLinear(BaseOP):
         return out
 
 
+class GGUFMergedLinear(GGUFLinear):
+    """Output-concatenated GGUF linear.
+
+    Packed rows can be concatenated only when every projection uses same input
+    dimension and quant type. Mixed quant rows have different strides, so reject
+    them before allocating one ambiguous packed matrix.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        output_sizes: Sequence[int],
+        quant_type: int | Sequence[int],
+        has_bias: bool = False,
+    ):
+        self.output_sizes = tuple(int(size) for size in output_sizes)
+        if not self.output_sizes or any(size <= 0 for size in self.output_sizes):
+            raise ValueError(f"output_sizes must contain positive values, got {output_sizes}")
+        if isinstance(quant_type, int):
+            types = (quant_type,) * len(self.output_sizes)
+        else:
+            types = tuple(int(item) for item in quant_type)
+        if len(types) != len(self.output_sizes):
+            raise ValueError("quant_type count must match output_sizes count")
+        if len(set(types)) != 1:
+            raise ValueError(
+                "GGUF merged linear cannot combine quant types with different row strides: "
+                f"{types}"
+            )
+        self.quant_types = types
+        super().__init__(in_features, sum(self.output_sizes), types[0], has_bias=has_bias)
+
+
+class GGUFLMHead(BaseOP):
+    """GGUF LM head with optional tied packed embedding and last-token gather."""
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        quant_type: int,
+        tied_embedding: GGUFEmbedding | None = None,
+    ):
+        self.num_embeddings = int(num_embeddings)
+        self.embedding_dim = int(embedding_dim)
+        self._quant_type = int(quant_type)
+        self.tied_embedding = tied_embedding
+        self.qweight = (
+            None
+            if tied_embedding is not None
+            else torch.empty(num_embeddings, row_bytes(embedding_dim, quant_type), dtype=torch.uint8)
+        )
+
+    def state_dict(self, *, prefix: str = "", result=None):
+        if self.tied_embedding is not None:
+            return result if result is not None else {}
+        result = result if result is not None else {}
+        result[f"{prefix}.qweight" if prefix else "qweight"] = self.qweight
+        return result
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False):
+        if self.tied_embedding is not None:
+            state_dict.pop(f"{prefix}.weight" if prefix else "weight", None)
+            state_dict.pop(f"{prefix}.qweight" if prefix else "qweight", None)
+            return
+        key = f"{prefix}.qweight" if prefix else "qweight"
+        self.qweight = state_dict.pop(key)
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor, last_token_indices: torch.Tensor | None = None) -> torch.Tensor:
+        if last_token_indices is None:
+            try:
+                from freetoken.core import get_global_ctx
+
+                batch = get_global_ctx().batch
+                if batch.is_prefill:
+                    last_token_indices = batch.attn_metadata.get_last_indices(batch.size)
+            except (AttributeError, RuntimeError):
+                # Direct layer tests and non-engine callers do not have a global batch.
+                pass
+        if last_token_indices is not None:
+            x = x[last_token_indices].contiguous()
+        qweight = self.tied_embedding.qweight if self.tied_embedding is not None else self.qweight
+        return fused_mul_mat_gguf(x, qweight, self._quant_type)
+
+
 class GGUFEmbedding(BaseOP):
     """Vocab embedding stored as a native GGUF block-quantized table.
 
@@ -125,4 +214,10 @@ class GGUFEmbedding(BaseOP):
         return y
 
 
-__all__ = ["GGUFLinear", "GGUFEmbedding", "fused_mul_mat_gguf"]
+__all__ = [
+    "GGUFLinear",
+    "GGUFMergedLinear",
+    "GGUFEmbedding",
+    "GGUFLMHead",
+    "fused_mul_mat_gguf",
+]

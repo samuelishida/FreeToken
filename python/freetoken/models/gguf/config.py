@@ -44,11 +44,12 @@ class GgufConfigShim:
 
 
 def _vocab_size(model_path: str) -> int:
-    from .reader import _reader
+    from .reader import _reader, gguf_shard_paths
 
-    for t in _reader(model_path).tensors:
-        if t.name == "token_embd.weight":
-            return int(t.shape[-1])  # ggml [hidden, vocab] -> vocab is last
+    for shard in gguf_shard_paths(model_path):
+        for t in _reader(shard).tensors:
+            if t.name == "token_embd.weight":
+                return int(t.shape[-1])  # ggml [hidden, vocab] -> vocab is last
     # A metadata-only GGUF (an FTW dir's source_metadata.gguf) strips the tensor table, so
     # fall back to the tokenizer vocab. llama.cpp sizes token_embd's rows to n_vocab =
     # len(tokenizer.ggml.tokens), so this equals the tensor-derived value exactly.

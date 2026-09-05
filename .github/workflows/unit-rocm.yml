@@ -1,0 +1,45 @@
+name: Unit tests (ROCm, self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Exact ROCm target from the FreeToken matrix
+        required: true
+        type: string
+        default: gfx1100
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unit-rocm
+  cancel-in-progress: false
+
+jobs:
+  rocm-unit:
+    runs-on: [self-hosted, rocm]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: FlashML-org/FreeToken
+          ref: main
+          path: FreeToken
+      - name: Validate target
+        working-directory: FreeToken
+        env:
+          FREETOKEN_ROCM_ARCH: ${{ inputs.target }}
+        run: |
+          .venv-rocm/bin/python -c "from freetoken.utils.arch import rocm_arch_capability; print(rocm_arch_capability('$FREETOKEN_ROCM_ARCH'))"
+      - name: Focused ROCm matrix gate
+        working-directory: FreeToken
+        env:
+          FREETOKEN_ROCM_ARCH: ${{ inputs.target }}
+          PYTORCH_ROCM_ARCH: ${{ inputs.target }}
+        run: |
+          PYTHONPATH=python .venv-rocm/bin/python -m pytest -q \
+            tests/utils/test_rocm_arch.py \
+            tests/kernels/test_rocm_launch_kwargs.py \
+            tests/kernels/test_gguf_rocm.py \
+            tests/engine/test_cpu_moe_graph_safety.py

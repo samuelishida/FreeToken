@@ -1,7 +1,9 @@
 # Supported models
 
 FreeToken loads HF safetensors checkpoints directly (plus native GGUF for
-Gemma-4). The checkpoints below are known-good — the prebuilt kernels are tuned
+Gemma-4 and Qwen3.5 adapter work). Qwen3.5 GGUF ROCm support remains target-
+matrix and fixture gated; it is not advertised as end-to-end known-good below.
+The checkpoints below are known-good — the prebuilt kernels are tuned
 for them; other checkpoints of the same architectures work too.
 
 | Model | HF checkpoints |
