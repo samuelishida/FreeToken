@@ -56,14 +56,14 @@ Current ROCm target matrix (Inc 13):
 
 | target family | targets | status in this checkout |
 | --- | --- | --- |
-| RDNA3 | gfx1100, gfx1101, gfx1102, gfx1103 | compile-only; gfx1100 has direct native GGUF kernel tests |
+| RDNA3 | gfx1100, gfx1101, gfx1102, gfx1103 | gfx1100 served GGUF smoke tested; other targets compile-only |
 | RDNA3.5 | gfx1150, gfx1151 | compile-only |
 | RDNA4 | gfx1200, gfx1201 | compile-only |
 
-No row above is end-to-end serving support yet. Native Q4_0/Q4_K/Q5_K/Q6_K/Q8_0
-dispatch is target-matrix validated and remains fail-closed for unknown targets;
-served-request, finite-logit, graph replay, and native/reference completion evidence
-must be collected on each physical target before changing status to tested.
+Only gfx1100 has end-to-end serving smoke evidence in this checkout. Native
+Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 dispatch is target-matrix validated and remains
+fail-closed for unknown targets; gfx1150/1151/gfx1200/1201 still need physical
+served-request, finite-logit, graph replay, and native/reference completion evidence.
 
 ## Method 2: Install from source
 

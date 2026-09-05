@@ -5,7 +5,7 @@ gfx target when requested target is absent from matrix.
 
 | target | family | wave | native GGUF types | evidence |
 | --- | --- | ---: | --- | --- |
-| gfx1100 | RDNA3 | 32 | Q4_0, Q4_K, Q5_K, Q6_K, Q8_0 | direct native tests; serving pending |
+| gfx1100 | RDNA3 | 32 | Q4_0, Q4_K, Q5_K, Q6_K, Q8_0 | direct native tests; Qwen3.5 CPU/GPU one-token serving smoke |
 | gfx1101 | RDNA3 | 32 | Q4_0, Q4_K, Q5_K, Q6_K, Q8_0 | compile-only |
 | gfx1102 | RDNA3 | 32 | Q4_0, Q4_K, Q5_K, Q6_K, Q8_0 | compile-only |
 | gfx1103 | RDNA3 | 32 | Q4_0, Q4_K, Q5_K, Q6_K, Q8_0 | compile-only |

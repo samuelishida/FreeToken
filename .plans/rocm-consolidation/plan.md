@@ -492,11 +492,12 @@ Gemma4 fixture was available. Native GGUF ROCm work remains Inc 8/9.
 - Done: loader tests pass without ROCm; real GPU result records model file hash, tokenizer behavior, and unsupported feature gates.
 
 **Evidence:** Ported generic Qwen3.5 GGUF metadata/config conversion, dense/GDN/head
-weight mapping, Q5_K/Q6_K expert-bank contracts, atomic control-token registration,
-chat-template resolution, and allocation-free resident budget helper. Focused tests
-passed `38 passed` in `/tmp/hawk-implement-plan-check-inc8-static.log` (includes all
-Inc7 tests); no local Qwen3.5 GGUF checkpoint was available for finite-logit TP1
-serving, so model-file/completion evidence remains hardware/fixture-pending.
+weight mapping, mixed Q4_K/Q5_K/Q6_K/Q8_0 expert-bank contracts, atomic control-token
+registration, chat-template resolution, and allocation-free resident budget helper.
+Focused tests passed `38 passed` in `/tmp/hawk-implement-plan-check-inc8-static.log`
+(includes all Inc7 tests). Real fixture `Qwen_Qwen3.5-35B-A3B-Q4_K_S.gguf` loaded on
+gfx1100 through both CPU Q4_0 conversion and GPU native mixed-quant offload; one-token
+HTTP 200 finite-output smoke passed. Backend-specific outputs are not parity evidence.
 
 ### Inc 8 — Native ROCm Q4_0 GGUF (M)
 
@@ -609,7 +610,7 @@ hardware-pending; native MoE promotion remains deferred to Inc 16/Inc 14 gates.
 
 **Depends on:** 7, 8, 9
 **Unblocks:** 13
-**Status:** code-complete; live Qwen GGUF fixture pending.
+**Status:** live Qwen GGUF load/decode passed on gfx1100; native/reference parity and repeated A/B promotion pending.
 **Done criteria:** Qwen3.5 GGUF serving preserves tokenizer, tool-call, last-token, penalty, and finite-logit correctness across native/reference routes.
 
 #### Files to touch
@@ -660,9 +661,12 @@ covered by `tests/models/test_qwen35moe_last_token.py`. Added neutral sampling p
 fields, prompt-boundary tracking, generated-suffix presence/frequency application, engine
 plumbing, and OpenAI propagation. Focused gate passed `62 passed` in
 `/tmp/hawk-implement-plan-check-inc10.log`, including parser auto-selection and tool-call
-regressions. No real Qwen GGUF fixture is available in this environment, so finite-logit,
-non-empty served output, exact completion, and native/reference end-to-end agreement remain
-hardware/model-fixture pending.
+regressions. Real fixture `Qwen_Qwen3.5-35B-A3B-Q4_K_S.gguf` (sha256
+`c889bb0b997a0e22d0477bd00a427e2b0e923c2f7eec3bea21091354a7ffb5a7`) loaded on gfx1100:
+CPU Q4_0 conversion and GPU native mixed-quant offload both completed prefill warmup and
+returned finite one-token HTTP 200 completions. CPU returned `Thinking`; GPU returned `1`;
+these are separate backend/quantization streams, not parity evidence. Exact content parity,
+longer completion, and native/reference agreement remain pending.
 
 ### Inc 11 — HIP graph-safe expert copies (M)
 
@@ -753,7 +757,7 @@ HIP version exposing signal-memory graph nodes; no eager-only replay claim made.
 
 **Depends on:** 9, 10, 11, 12
 **Unblocks:** 14
-**Status:** code-complete; physical-target serving matrix pending.
+**Status:** gfx1100 CPU and GPU served; gfx1100 graph replay and other physical targets pending.
 **Done criteria:** declared ROCm support is backed by fresh build, graph/eager, native/reference GGUF, and served-request evidence across available gfx1100-1103, gfx1150-1151, and gfx1200-1201 targets.
 
 #### Files to touch
@@ -797,7 +801,10 @@ documentation with explicit compile-only status. Focused gate passed `19 passed,
 skipped` in `/tmp/hawk-implement-plan-check-inc13.log`; cache-rebuild e2e skipped
 because no test model was supplied. Available hardware is gfx1100 only, so served
 requests, graph/eager comparison, and native/reference matrix cells for other targets
-remain pending.
+remain pending. Available gfx1100 served the real Qwen fixture through CPU Q4_0 and GPU
+native mixed-quant offload; GPU used the in-tree Triton full-fetch LRU fallback because
+CUDA-only `flashlib.kernels.slot_cache` is absent. gfx1150/1151/gfx1200/1201 and real HIP
+graph replay remain pending.
 
 ### Inc 14 — ROCm benchmark and provenance gates (M)
 
@@ -885,7 +892,7 @@ usable model fixture; incumbent default remains unchanged.
 
 **Depends on:** 9, 10, 14
 **Unblocks:** none
-**Status:** code-complete; served promotion pending.
+**Status:** code-complete; gfx1100 native served smoke passed; performance promotion pending.
 **Done criteria:** portable native Qwen GGUF expert kernels are merged only if multi-quant numerical parity and served decode improve over incumbent; gfx1100-only candidates remain opt-in experiments.
 
 #### Files to touch
@@ -919,10 +926,11 @@ usable model fixture; incumbent default remains unchanged.
 **Evidence:** Added guarded packed GGUF MoE gate/up/down routing, reusable work buffers,
 explicit raw/slot ID spaces, mixed Q5_K/Q6_K strided dispatch, and weighted Triton
 route reduction. Contract, grouped-route, and mixed-quant tests pass `8 passed` in
-`/tmp/hawk-implement-plan-check-inc16.log`; gfx1100 live Q5_K and Q6_K native output
-matches dequantized/Q8_1 reference with finite results. Candidate fused gate/up and
-ID-aware paths remain opt-in. No real Qwen serving fixture or repeated A/B run exists,
-so no default/performance promotion is claimed.
+`/tmp/hawk-implement-plan-check-inc16.log`; gfx1100 live Q5_K, Q6_K, and Q8_0 native
+output matches dequantized/Q8_1 reference within the BF16 reduction gate with finite
+results. Candidate fused gate/up and ID-aware paths remain opt-in. Real Qwen native GPU
+offload loaded mixed Q4_K/Q5_K/Q6_K/Q8_0 banks and served two finite one-token requests;
+no incumbent/candidate A/B run exists, so no default/performance promotion is claimed.
 
 ### Inc 17 — ROCm profiler and JIT hygiene (S)
 
