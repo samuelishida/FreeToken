@@ -992,6 +992,15 @@ trace was captured in this run; no profiler or speed claim is made.
 - Rollback: every candidate has an explicit feature/capability gate and incumbent path; failed evidence disables candidate without deleting reference code.
 - Human handoff: do not push or open/comment on PRs from agent workflow; contributor reviews every line and supplies real hardware evidence.
 
+**Final gate snapshot:** Full non-slow validation on the shared ROCm venv reached
+`1658 passed, 81 skipped, 13 deselected, 27 failed`; the one registry-coverage failure
+introduced by the GGUF key was fixed in `8a70c7e` and its focused regression passes.
+Remaining failures are outside this Qwen3.5 GGUF increment: three explicit flashinfer
+dependency failures, sixteen DSV4 sparse-attention Triton AMD compiler assertions, three
+Qwen4/QSA chunked-prefill bitwise mismatches, and four CUDA Marlin custom-op failures.
+The change-scoped gate passes `100 passed`, plus AOT coverage `2 passed`; no full-suite
+rerun was needed after isolating the single fixed registry failure.
+
 ## Standards / common-mistakes referenced
 
 - `upstream/main:AGENTS.md:1-71` — binding AI policy, repository layout, development commands, test placement, A/B requirement, and no agent push/PR actions.
