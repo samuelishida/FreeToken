@@ -70,11 +70,11 @@ shared virtual environment, push branches, or open/comment on GitHub PRs.
 - Decision: each implementation increment is one upstreamable PR with its own
   regression test and, for performance work, same-model/same-settings A/B
   evidence. Source: `upstream/main:CONTRIBUTING.md:34-40`.
-- Answered from code: current GGUF registry has Gemma4 only. Source:
-  `python/freetoken/models/register.py:103-109` and
-  `python/freetoken/models/gguf/config.py:17-21`.
-- Answered from code: current native GGUF path exposes Q4_0, Q8_0, and Q6_K
-  groups, with a reference dequant fallback. Source:
+- Answered from code: current GGUF registry covers Gemma4 and Qwen3.5 MoE.
+  Source: `python/freetoken/models/register.py` and
+  `python/freetoken/models/gguf/config.py`.
+- Answered from code: current native GGUF path exposes Q4_0, Q4_K, Q5_K, Q6_K,
+  and Q8_0 groups, with a reference dequant fallback. Source:
   `python/freetoken/layers/gguf.py:32-65`.
 - Answered from code: benchmark commands already cover served MoE decode,
   expert loading, offload copies, and bandwidth. Source:
@@ -443,8 +443,8 @@ all-reduce and serving remain hardware-pending.
 **Evidence:** Added complete gguf-py-compatible block/type metadata through current
 types `F32`–`Q1_0`, a Q8_0 reference dequant, ordered split-GGUF resolution, duplicate
 name and packed-row validation, and explicit merged-linear/LM-head contracts. Native
-dispatch remains limited to existing proven Q4_0/Q8_0/Q6_K routes; mixed quantized
-merged rows reject with a stride error. Focused gate passed `26 passed` in
+dispatch covers proven Q4_0/Q4_K/Q5_K/Q6_K/Q8_0 routes; mixed quantized merged rows
+retain separate packed slices and concatenate computed outputs. Focused gate passed `26 passed` in
 `/tmp/hawk-implement-plan-check-inc6.log`; Gemma4 GGUF rope regression passed `1
 passed, 1 skipped` in `/tmp/hawk-implement-plan-check-inc6-gemma.log`. Shared ROCm
 environment lacks flashlib, so metadata tests use scoped import stubs; no CUDA
