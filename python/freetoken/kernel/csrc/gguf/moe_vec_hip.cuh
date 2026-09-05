@@ -281,6 +281,34 @@ static __global__ void moe_vec_q_strided(
 }
 
 template <typename scalar_t>
+static void moe_vec_q8_0_q8_1_strided_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, const int64_t expert_stride_bytes,
+    const int64_t row_stride_bytes, hipStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  hipLaunchKernelGGL(( moe_vec_q_strided<scalar_t, QK8_0, QI8_0, block_q8_0, VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>),
+      dim3(block_nums), dim3(block_dims), 0, stream, vx, vy, dst, topk_ids,
+      top_k, ncols, nrows, token_stride, expert_stride_bytes, row_stride_bytes);
+}
+
+template <typename scalar_t>
+static void moe_vec_q4_K_q8_1_strided_cuda(
+    const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
+    const int top_k, const int tokens, const int ncols, const int nrows,
+    const int token_stride, const int64_t expert_stride_bytes,
+    const int64_t row_stride_bytes, hipStream_t stream) {
+  const int block_num_y = (nrows + GGML_CUDA_MMV_Y - 1) / GGML_CUDA_MMV_Y;
+  const dim3 block_nums(block_num_y, 1, tokens * top_k);
+  const dim3 block_dims(WARP_SIZE, GGML_CUDA_MMV_Y, 1);
+  hipLaunchKernelGGL(( moe_vec_q_strided<scalar_t, QK_K, QI4_K, block_q4_K, VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>),
+      dim3(block_nums), dim3(block_dims), 0, stream, vx, vy, dst, topk_ids,
+      top_k, ncols, nrows, token_stride, expert_stride_bytes, row_stride_bytes);
+}
+
+template <typename scalar_t>
 static void moe_vec_q5_K_q8_1_strided_cuda(
     const void* vx, const void* vy, scalar_t* dst, const int* topk_ids,
     const int top_k, const int tokens, const int ncols, const int nrows,

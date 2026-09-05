@@ -878,8 +878,8 @@ torch::Tensor ggml_moe_a8_vec_strided(
               "ggml_moe_a8_vec_strided requires CUDA/HIP tensors");
   TORCH_CHECK(X.is_contiguous() && W.is_contiguous() && topk_ids.is_contiguous(),
               "ggml_moe_a8_vec_strided requires contiguous tensors");
-  TORCH_CHECK(type == 13 || type == 14,
-              "ggml_moe_a8_vec_strided supports Q5_K (13) and Q6_K (14), got ", type);
+  TORCH_CHECK(type == 8 || type == 12 || type == 13 || type == 14,
+              "ggml_moe_a8_vec_strided supports Q8_0 (8), Q4_K (12), Q5_K (13), and Q6_K (14), got ", type);
   TORCH_CHECK(X.dim() == 2 && W.dim() == 3 && topk_ids.dim() == 2,
               "invalid ggml_moe_a8_vec_strided tensor ranks");
   TORCH_CHECK(tokens == X.size(0) && top_k == topk_ids.size(1),
@@ -921,7 +921,17 @@ torch::Tensor ggml_moe_a8_vec_strided(
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8_strided", [&] {
     quantize_row_q8_1_cuda<scalar_t>(
         (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
-    if (type == 13) {
+    if (type == 8) {
+      moe_vec_q8_0_q8_1_strided_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), top_k, tokens, col, row,
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+    } else if (type == 12) {
+      moe_vec_q4_K_q8_1_strided_cuda<scalar_t>(
+          (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
+          (int*)topk_ids.data_ptr(), top_k, tokens, col, row,
+          quant_X.stride(0), expert_stride_bytes, row_stride_bytes, stream);
+    } else if (type == 13) {
       moe_vec_q5_K_q8_1_strided_cuda<scalar_t>(
           (void*)W.data_ptr(), (void*)quant_X.data_ptr(), (scalar_t*)Y.data_ptr(),
           (int*)topk_ids.data_ptr(), top_k, tokens, col, row,

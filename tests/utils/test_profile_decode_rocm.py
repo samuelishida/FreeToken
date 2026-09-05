@@ -6,7 +6,7 @@ import pytest
 BENCHMARKS = Path(__file__).resolve().parents[2] / "benchmarks"
 sys.path.insert(0, str(BENCHMARKS))
 
-from profile_decode_rocm import build_report, load_trace  # noqa: E402
+from profile_decode_rocm import build_report, load_trace, _resolve_generated_trace  # noqa: E402
 
 
 def _payload():
@@ -46,6 +46,49 @@ def test_load_trace_accepts_event_lists(tmp_path):
     path = tmp_path / "trace.json"
     path.write_text("[{\"kind\": \"kernel\"}]", encoding="utf-8")
     assert load_trace(path) == {"events": [{"kind": "kernel"}]}
+
+
+def test_load_trace_normalises_rocprofv3_and_tolerates_raw_kernel_bytes(tmp_path):
+    import json
+
+    path = tmp_path / "trace_results.json"
+    payload = {
+        "rocprofiler-sdk-tool": [
+            {
+                "agents": [{"type": 2, "name": "gfx1100", "product_name": "RX 7900 XTX"}],
+                "kernel_symbols": [{"kernel_id": 7, "truncated_kernel_name": "raw-name"}],
+                "buffer_records": {
+                    "kernel_dispatch": [
+                        {
+                            "start_timestamp": 10,
+                            "end_timestamp": 20,
+                            "dispatch_info": {"kernel_id": 7},
+                        }
+                    ],
+                    "memory_copy": [],
+                    "hip_api": [],
+                },
+            }
+        ]
+    }
+    encoded = json.dumps(payload).encode("utf-8").replace(b"raw-name", b"raw-\x8dname")
+    path.write_bytes(encoded)
+
+    trace = load_trace(path)
+
+    assert trace["rocprofv3"] is True
+    assert trace["kernels"] == [
+        {"kind": "kernel", "name": "raw-\ufffdname", "start_ns": 10, "end_ns": 20}
+    ]
+    assert trace["identity"]["agents"][0]["target"] == "gfx1100"
+
+
+def test_resolve_generated_rocprofv3_suffix(tmp_path):
+    requested = tmp_path / "profile.rocprof.json"
+    generated = tmp_path / "profile.rocprof.json_results.json"
+    generated.write_text("{}", encoding="utf-8")
+
+    assert _resolve_generated_trace(requested) == generated
 
 
 @pytest.mark.parametrize("value", [None, "bad", 3])

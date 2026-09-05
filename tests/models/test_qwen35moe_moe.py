@@ -7,7 +7,13 @@ import torch
 
 from freetoken.distributed import set_tp_info, try_get_tp_info
 from freetoken.models.config import ModelConfig, RotaryConfig
-from freetoken.models.gguf.dequant import GGML_Q5_K, GGML_Q6_K
+from freetoken.models.gguf.dequant import (
+    GGML_Q4_K,
+    GGML_Q5_K,
+    GGML_Q6_K,
+    GGML_Q8_0,
+    row_bytes,
+)
 from freetoken.models.qwen3_5_moe.moe import Qwen3_5MoE
 
 
@@ -44,7 +50,7 @@ def _config(*, expert_quant="none", moe_weight_format=None, down_types=()):
     )
 
 
-@pytest.mark.parametrize("down_type", [GGML_Q5_K, GGML_Q6_K])
+@pytest.mark.parametrize("down_type", [GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0])
 def test_gguf_resident_construction_uses_native_packed_shapes(down_type):
     config = _config(moe_weight_format="gguf", expert_quant="gguf", down_types=(down_type,))
     with torch.device("meta"):
@@ -52,7 +58,7 @@ def test_gguf_resident_construction_uses_native_packed_shapes(down_type):
     experts = moe.experts
     assert experts.weight_format == "gguf"
     assert experts.gate_up_proj.shape == (2, 512, 144)
-    assert experts.down_proj.shape[-1] == (176 if down_type == GGML_Q5_K else 210)
+    assert experts.down_proj.shape[-1] == row_bytes(256, down_type)
     assert experts.gate_up_proj.dtype == torch.uint8
     assert experts.down_proj.dtype == torch.uint8
 

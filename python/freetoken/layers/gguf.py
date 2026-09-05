@@ -24,6 +24,8 @@ from freetoken.models.gguf.dequant import (
     GGML_F32,
     GGML_NAME,
     GGML_Q4_0,
+    GGML_Q4_K,
+    GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     row_bytes,
@@ -34,9 +36,9 @@ from .base import BaseOP
 # ggml type groups for kernel dispatch (subset we build kernels for).
 _UNQUANTIZED = {GGML_F32, GGML_F16, GGML_BF16}
 # standard + k-quants: both an MMVQ (small-batch GEMV) and MMQ (large-batch) kernel exist.
-_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
-_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q6_K}
+_MMVQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_MMQ = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
+_DEQUANT = {GGML_Q4_0, GGML_Q8_0, GGML_Q4_K, GGML_Q5_K, GGML_Q6_K}
 
 # Below this token count, the MMVQ GEMV kernel wins (matches vLLM's heuristic).
 _MMVQ_SAFE = 6
@@ -93,9 +95,9 @@ class GGUFLinear(BaseOP):
 class GGUFMergedLinear(GGUFLinear):
     """Output-concatenated GGUF linear.
 
-    Packed rows can be concatenated only when every projection uses same input
-    dimension and quant type. Mixed quant rows have different strides, so reject
-    them before allocating one ambiguous packed matrix.
+    Packed rows can be concatenated when projections share quant type. GGUF exports
+    may use different native types for each output slice; retain those slices separately
+    and concatenate computed outputs, avoiding lossy dequantize/requantize conversion.
     """
 
     def __init__(
@@ -114,13 +116,31 @@ class GGUFMergedLinear(GGUFLinear):
             types = tuple(int(item) for item in quant_type)
         if len(types) != len(self.output_sizes):
             raise ValueError("quant_type count must match output_sizes count")
-        if len(set(types)) != 1:
-            raise ValueError(
-                "GGUF merged linear cannot combine quant types with different row strides: "
-                f"{types}"
-            )
         self.quant_types = types
-        super().__init__(in_features, sum(self.output_sizes), types[0], has_bias=has_bias)
+        self._mixed = len(set(types)) != 1
+        if not self._mixed:
+            super().__init__(in_features, sum(self.output_sizes), types[0], has_bias=has_bias)
+            return
+        self.in_features = in_features
+        self.out_features = sum(self.output_sizes)
+        self._quant_type = None
+        self.bias = torch.empty(self.out_features) if has_bias else None
+        for i, (size, qtype) in enumerate(zip(self.output_sizes, types)):
+            setattr(self, f"qweight_{i}", torch.empty(
+                size, row_bytes(in_features, qtype), dtype=torch.uint8
+            ))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self._mixed:
+            return super().forward(x)
+        parts = [
+            fused_mul_mat_gguf(x, getattr(self, f"qweight_{i}"), qtype)
+            for i, qtype in enumerate(self.quant_types)
+        ]
+        out = torch.cat(parts, dim=-1)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
 
 
 class GGUFLMHead(BaseOP):

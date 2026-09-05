@@ -3,10 +3,25 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Iterator
 
 import torch
-from flashlib.kernels.slot_cache import N_STATS, Stat
+
+try:
+    from flashlib.kernels.slot_cache import N_STATS, Stat
+except ModuleNotFoundError as exc:
+    if exc.name not in {"flashlib", "flashlib.kernels", "flashlib.kernels.slot_cache"}:
+        raise
+
+    # CPU MoE, native GGUF resident paths, and ROCm offload use in-tree paths. Keep
+    # imports usable in environments where flashlib's CUDA wheel is intentionally absent.
+    N_STATS = 3
+
+    class Stat(IntEnum):
+        ACTIVE = 0
+        MISS = 1
+        CALLS = 2
 
 # Fuse the per-bank expert copies into a single multi-bank launch (one per copy_missing
 # instead of one per bank). Set FREETOKEN_FUSED_COPY=0 to force the legacy per-bank path
@@ -61,6 +76,11 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # GGUF Qwen3.5 routed experts: gate/up and down are packed uint8 rows. ``gguf``
+    # uses uniform Q8_0 down rows; ``gguf_native`` preserves per-layer K-quant down
+    # types behind a padded strided row ABI. Both share cache bank names.
+    "gguf": ("gate_up", "down"),
+    "gguf_native": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -106,6 +126,10 @@ _BANK_BYTES_PER_EXPERT = {
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
     "q4_0": lambda H, I: 2 * I * (H // 32) * 18 + H * (I // 32) * 18,
+    # Conservative Q8_0 upper bound: terminal GGUF layers may use Q8_0 gate/up,
+    # and native down caches are padded to at least Q8_0 row width.
+    "gguf": lambda H, I: 2 * I * (H // 32) * 34 + H * (I // 32) * 34,
+    "gguf_native": lambda H, I: 2 * I * (H // 32) * 34 + H * (I // 32) * 34,
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
@@ -895,11 +919,21 @@ class OffloadMoeCache:
         self.stat_steps_layer.zero_()
 
     def record_decode_stats(self, layer_id: int) -> None:
-        """No-op: ``ensure_experts`` accumulates into ``lru_stats`` inside its own launch.
-
-        Kept so the hybrid and non-hybrid call sites stay symmetric. The previous version
-        was eight torch ops per layer per step, all captured into the decode graph.
-        """
+        """Record non-hybrid stats for flashlib or the in-tree Triton LRU fallback."""
+        if not getattr(self, "_gpu_lru_fallback", False):
+            return  # flashlib lru_ensure accumulates into lru_stats in its own launch
+        assert 0 <= layer_id < self.num_layers, f"layer_id {layer_id} out of range [0, {self.num_layers})"
+        missing = self.num_missing_full.sum()
+        fetched = self.num_indices.sum()
+        active = self.active_mask.sum()
+        self.stat_missing += missing
+        self.stat_fetched += fetched
+        self.stat_active += active
+        self.stat_calls += 1
+        self.stat_missing_layer[layer_id] += missing
+        self.stat_fetched_layer[layer_id] += fetched
+        self.stat_active_layer[layer_id] += active
+        self.stat_steps_layer[layer_id] += 1
 
     def record_decode_stats_hybrid(self, layer_id: int) -> None:
         """Hybrid stats: full miss count (pre-cap), the PCIe-fetched count (capped), and
@@ -919,7 +953,7 @@ class OffloadMoeCache:
         self.stat_steps_layer[layer_id] += 1
 
     def decode_miss_stats(self) -> dict:
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or getattr(self, "_gpu_lru_fallback", False):
             active = int(self.stat_active.item())
             missing = int(self.stat_missing.item())
             calls = int(self.stat_calls.item())
@@ -948,7 +982,7 @@ class OffloadMoeCache:
         lists indexed by MoE-layer id: missing/active experts per step and the realized
         miss_rate (missing/active) -- i.e. how cacheable each layer's routing actually was
         under the running LRU. Reads device tensors once (no per-step host sync)."""
-        if self.decode_target == "hybrid":
+        if self.decode_target == "hybrid" or getattr(self, "_gpu_lru_fallback", False):
             steps = self.stat_steps_layer.tolist()
             missing = self.stat_missing_layer.tolist()
             active = self.stat_active_layer.tolist()

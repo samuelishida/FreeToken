@@ -241,6 +241,29 @@ def quantize_q8_0(w: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
+def quantize_q4_0(w: torch.Tensor) -> torch.Tensor:
+    """Quantize dense rows to llama.cpp-compatible packed Q4_0 blocks.
+
+    Q4_0 stores one fp16 scale and 16 low/high nibble pairs per 32-element
+    block. The scale sign follows ggml's convention (largest-magnitude value
+    maps to code zero), so the existing CPU and GPU GGUF kernels can consume
+    these rows without a format-specific dequant path.
+    """
+    n = w.shape[-1]
+    if n % 32:
+        raise ValueError(f"Q4_0 quantize needs last dim % 32 == 0, got {n}")
+    wq = w.float().view(*w.shape[:-1], n // 32, 32)
+    amax = wq.abs().amax(dim=-1, keepdim=True)
+    maxv = wq.gather(-1, wq.abs().argmax(dim=-1, keepdim=True))
+    d = torch.where(amax > 0, maxv / -8.0, torch.ones_like(maxv))
+    q = torch.round(wq / d).clamp(-8, 7).to(torch.int16) + 8
+    packed = (q[..., :16] | (q[..., 16:] << 4)).to(torch.uint8)
+    d_bytes = d.to(torch.float16).view(torch.uint8)
+    return torch.cat([d_bytes, packed], dim=-1).reshape(
+        *w.shape[:-1], (n // 32) * 18
+    ).contiguous()
+
+
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q4_K: dequant_q4_k,
@@ -310,6 +333,7 @@ __all__ = [
     "dequant_q8_0",
     "dequant_q5_k",
     "dequant_q6_k",
+    "quantize_q4_0",
     "quantize_q8_0",
     "dequantize",
 ]

@@ -1230,6 +1230,10 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    # Qwen3.5 GGUF keeps mixed native K-quants for GPU offload, but its CPU
+    # provider converts routed experts to the executor's supported Q4_0 layout.
+    if fmt == "gguf":
+        fmt = "q4_0"
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 

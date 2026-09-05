@@ -3,6 +3,7 @@ from .gguf import (
     convert_qwen35moe_to_gguf,
     is_gguf_model,
     iter_gguf_weights,
+    load_gguf_expert_sources_cpu,
     load_gguf_expert_sources,
     load_gguf_expert_sources_native,
     parse_gguf_config,
@@ -30,4 +31,5 @@ __all__ = [
     "is_gguf_model",
     "load_gguf_expert_sources",
     "load_gguf_expert_sources_native",
+    "load_gguf_expert_sources_cpu",
 ]

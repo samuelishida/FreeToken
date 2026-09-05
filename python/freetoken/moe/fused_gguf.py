@@ -1,11 +1,12 @@
-"""Expert GEMV over native GGUF Q4_K gate/up + K-quant down banks.
+"""Expert GEMV over native GGUF gate/up + K-quant down banks.
 
 Ports vLLM/sglang's ``_fused_moe_gguf`` MMVQ path onto FreeToken's offload-cache
 interface: experts are streamed to the GPU as packed block bytes and dequantized
-*inside* GGUF kernels -- no bf16 expert copy is materialized. ``gate_up`` stays native
-Q4_K; legacy CPU/hybrid offload ``down`` is Q8_0, while plain GPU offload and
-resident mode retain each layer's native Q5_K/Q6_K type. Decode uses MMVQ; larger
-prefill uses aligned grouped MMQ where its shape contract is proven.
+*inside* GGUF kernels -- no bf16 expert copy is materialized. ``gate_up`` is usually
+Q4_K but can be Q8_0 on terminal full-attention layers; legacy offload ``down`` is
+Q8_0, while native GPU/resident paths retain each layer's Q4_K/Q5_K/Q6_K/Q8_0 type.
+Decode uses MMVQ; larger prefill uses aligned grouped MMQ where its shape contract is
+proven.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from dataclasses import dataclass, field
 import torch
 
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
-from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q8_0
+from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q8_0, row_bytes
 
 _ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
 
@@ -51,6 +52,7 @@ class MoeDecodeWork:
         *,
         id_space: str,
         down_quant_type: int,
+        gate_quant_type: int = GGML_Q4_K,
     ) -> None:
         if self.phase not in {"moe_decode", "moe_prefill"}:
             raise ValueError(f"invalid GGUF MoE phase {self.phase!r}")
@@ -77,7 +79,7 @@ class MoeDecodeWork:
         if gate_up_q.stride(2) != 1 or down_q.stride(2) != 1:
             raise ValueError("packed GGUF bank innermost stride must be one byte")
         self.id_space = id_space
-        self.quant_type = 12
+        self.quant_type = int(gate_quant_type)
         self.down_quant_type = int(down_quant_type)
         self.gate_expert_stride_bytes = int(gate_up_q.stride(0))
         self.gate_row_stride_bytes = int(gate_up_q.stride(1))
@@ -265,6 +267,19 @@ def _gguf_moe_matmul(
     )
 
 
+def _maybe_packed_strides(weight: torch.Tensor, quant_type: int, cols: int):
+    """Return strides only when bank rows contain padding for ``quant_type``."""
+    try:
+        tight_row = row_bytes(cols, quant_type)
+    except (AssertionError, ValueError):
+        # Shape-only dispatch tests use tiny placeholder rows that are not
+        # legal GGUF K-quant geometry; preserve compact-path behavior there.
+        return None, None
+    if weight.stride(1) == tight_row and weight.stride(0) == weight.shape[1] * tight_row:
+        return None, None
+    return int(weight.stride(0)), int(weight.stride(1))
+
+
 def fused_experts_gguf(
     hidden_states: torch.Tensor,
     gate_up_q: torch.Tensor,  # [num_slots, 2I, row_bytes(H, Q4_K)] uint8
@@ -275,7 +290,10 @@ def fused_experts_gguf(
     *,
     is_prefill: bool = False,
     dispatch_metadata: dict | None = None,
+    gate_quant_type: int = GGML_Q4_K,
     down_quant_type: int = GGML_Q8_0,
+    gate_stride_bytes: int | None = None,
+    gate_row_stride_bytes: int | None = None,
     down_stride_bytes: int | None = None,
     down_row_stride_bytes: int | None = None,
     work: MoeDecodeWork | None = None,
@@ -306,6 +324,7 @@ def fused_experts_gguf(
         work.bind(
             hidden_states, gate_up_q, down_q, topk_weights, topk_ids,
             id_space=id_space, down_quant_type=down_quant_type,
+            gate_quant_type=gate_quant_type,
         )
         gate_out = None
         if not fused_gate_up:
@@ -361,8 +380,10 @@ def fused_experts_gguf(
     else:
         with torch.profiler.record_function("moe_gate_up"):
             gate_up = _gguf_moe_matmul(
-                hidden_states, gate_up_q, topk_ids, int(GGML_Q4_K), n2, gate_dispatch,
+                hidden_states, gate_up_q, topk_ids, int(gate_quant_type), n2, gate_dispatch,
                 output=gate_out, quant_x=gate_quant_x, work=work,
+                weight_stride_bytes=gate_stride_bytes,
+                weight_row_stride_bytes=gate_row_stride_bytes,
             )
         with torch.profiler.record_function("moe_activation"):
             inter = act_fn(gate_up, out=inter)
@@ -389,14 +410,17 @@ def fused_experts_gguf_native(
     activation: str,
     *,
     down_quant_type: int | None,
+    gate_quant_type: int = GGML_Q4_K,
     is_prefill: bool = False,
     workspace: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Resident native expert path; no cache slot remap or Q8 conversion."""
     from freetoken.kernel.gguf import gguf_dispatch, gguf_runtime_metadata
-    from freetoken.models.gguf.dequant import GGML_Q5_K, GGML_Q6_K
+    from freetoken.models.gguf.dequant import GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0
 
-    if down_quant_type not in (GGML_Q5_K, GGML_Q6_K):
+    if gate_quant_type not in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0):
+        raise ValueError(f"unsupported resident GGUF gate/up type {gate_quant_type!r}")
+    if down_quant_type not in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0):
         raise ValueError(f"unsupported resident GGUF down type {down_quant_type!r}")
     act_fn = _ACT.get(activation)
     if act_fn is None:
@@ -406,11 +430,17 @@ def fused_experts_gguf_native(
     phase = "moe_prefill" if is_prefill else "moe_decode"
     arch = gguf_runtime_metadata().get("arch")
     gate_dispatch = gguf_dispatch(
-        phase, GGML_Q4_K, gate_up_q.shape[1], hidden_states.shape[1], num_tokens, arch
+        phase, gate_quant_type, gate_up_q.shape[1], hidden_states.shape[1], num_tokens, arch
     )
     down_dispatch = gguf_dispatch(
         phase, down_quant_type, down_q.shape[1], gate_up_q.shape[1] // 2,
         num_tokens * top_k, arch
+    )
+    gate_stride_bytes, gate_row_stride_bytes = _maybe_packed_strides(
+        gate_up_q, gate_quant_type, hidden_states.shape[1]
+    )
+    down_stride_bytes, down_row_stride_bytes = _maybe_packed_strides(
+        down_q, down_quant_type, gate_up_q.shape[1] // 2
     )
     if isinstance(workspace, MoeDecodeWork):
         return fused_experts_gguf(
@@ -422,9 +452,12 @@ def fused_experts_gguf_native(
             activation,
             is_prefill=is_prefill,
             dispatch_metadata={"gate_up": gate_dispatch, "down": down_dispatch},
+            gate_quant_type=gate_quant_type,
             down_quant_type=down_quant_type,
-            down_stride_bytes=int(down_q.stride(0)),
-            down_row_stride_bytes=int(down_q.stride(1)),
+            gate_stride_bytes=gate_stride_bytes,
+            gate_row_stride_bytes=gate_row_stride_bytes,
+            down_stride_bytes=down_stride_bytes,
+            down_row_stride_bytes=down_row_stride_bytes,
             work=workspace,
             id_space="raw",
         )
@@ -437,8 +470,10 @@ def fused_experts_gguf_native(
                 gate_out = torch.empty(shape, dtype=hidden_states.dtype, device=hidden_states.device)
                 workspace["gate_up"] = gate_out
         gate_up = _gguf_moe_matmul(
-            hidden_states, gate_up_q, topk_ids, GGML_Q4_K,
-            gate_up_q.shape[1], gate_dispatch, gate_out
+            hidden_states, gate_up_q, topk_ids, gate_quant_type,
+            gate_up_q.shape[1], gate_dispatch, gate_out,
+            weight_stride_bytes=gate_stride_bytes,
+            weight_row_stride_bytes=gate_row_stride_bytes,
         )
     with torch.profiler.record_function("moe_activation_native"):
         inter = None
@@ -459,7 +494,9 @@ def fused_experts_gguf_native(
                 workspace["down"] = down_out
         out = _gguf_moe_matmul(
             inter, down_q, topk_ids.reshape(-1, 1), down_quant_type,
-            down_q.shape[1], down_dispatch, down_out
+            down_q.shape[1], down_dispatch, down_out,
+            weight_stride_bytes=down_stride_bytes,
+            weight_row_stride_bytes=down_row_stride_bytes,
         )
     out = out.reshape(num_tokens, top_k, down_q.shape[1])
     return _reduce_routes(out, None, topk_weights.reshape(num_tokens, top_k))

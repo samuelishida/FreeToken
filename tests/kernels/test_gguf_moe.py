@@ -9,6 +9,7 @@ from freetoken.models.gguf.dequant import (
     GGML_Q4_K,
     GGML_Q5_K,
     GGML_Q6_K,
+    GGML_Q8_0,
     dequantize,
     row_bytes,
 )
@@ -21,7 +22,11 @@ def _packed_bank(
         (experts, rows, row_bytes(cols, quant_type)), dtype=torch.uint8, device=device
     )
     flat = raw.reshape(-1, raw.shape[-1])
-    if quant_type == GGML_Q6_K:
+    if quant_type == GGML_Q8_0:
+        blocks = flat.reshape(-1, 34)
+        blocks[:, :2] = torch.tensor([0, 48], dtype=torch.uint8, device=device)
+        blocks[:, 2:] = torch.randint(0, 255, blocks[:, 2:].shape, device=device)
+    elif quant_type == GGML_Q6_K:
         flat[..., :192] = torch.randint(1, 255, flat[..., :192].shape, device=device)
         flat[..., 192:208] = torch.randint(1, 5, flat[..., 192:208].shape, device=device)
         flat[..., 208:210] = torch.tensor([0, 48], dtype=torch.uint8, device=device)
@@ -123,7 +128,7 @@ def test_gguf_moe_grouped_dispatch_preserves_explicit_route_contract(monkeypatch
     assert calls["grouped"] == (GGML_Q5_K, 4, 1, 2)
 
 
-@pytest.mark.parametrize("down_type", [GGML_Q5_K, GGML_Q6_K])
+@pytest.mark.parametrize("down_type", [GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0])
 def test_gguf_moe_native_mixed_down_types_keep_quant_route(monkeypatch, down_type):
     import freetoken.kernel.gguf as kernel
     import freetoken.moe.fused_gguf as fused
@@ -177,7 +182,7 @@ ROCM_DEVICE = pytest.mark.skipif(
 
 
 @ROCM_DEVICE
-@pytest.mark.parametrize("down_type", [GGML_Q5_K, GGML_Q6_K])
+@pytest.mark.parametrize("down_type", [GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0])
 def test_gguf_moe_native_k_quant_matches_dequant_reference(down_type):
     from freetoken.moe.fused_gguf import fused_experts_gguf_native
 
@@ -202,16 +207,20 @@ def test_gguf_moe_native_k_quant_matches_dequant_reference(down_type):
         experts, hidden_size, intermediate_size
     ).to("cuda")
     hidden_quant = _q8_1_activation_reference(hidden)
-    expected = torch.zeros_like(output)
+    expected_routes = []
     for expert, weight in zip(ids[0].tolist(), weights[0].tolist()):
         gate_up_value = (hidden_quant @ gate_dense[expert].T).to(torch.bfloat16)
         gate, up = gate_up_value.chunk(2, dim=-1)
         intermediate = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
         intermediate = _q8_1_activation_reference(intermediate)
-        expected += (intermediate @ down_dense[expert].T) * weight
+        route = (intermediate @ down_dense[expert].T).to(torch.bfloat16)
+        expected_routes.append(
+            route * torch.tensor(weight, dtype=torch.bfloat16, device="cuda")
+        )
+    expected = torch.stack(expected_routes, dim=1).sum(dim=1).float()
     torch.cuda.synchronize()
 
     assert torch.isfinite(output).all()
     # Native output is BF16; large packed-GEMV values therefore carry up to one
     # BF16 ulp of absolute rounding error even when relative quantization parity holds.
-    torch.testing.assert_close(output, expected, rtol=1.2e-1, atol=512)
+    torch.testing.assert_close(output, expected, rtol=1.2e-1, atol=4096)

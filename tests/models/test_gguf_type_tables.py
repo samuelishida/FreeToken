@@ -24,6 +24,22 @@ def test_q8_0_reference_dequant_matches_signed_int8_scale():
     torch.testing.assert_close(dequantize(raw, GGML_Q8_0, torch.float32), expected)
 
 
+def test_q4_0_quantizer_roundtrips_rows_with_native_layout():
+    from freetoken.models.gguf.dequant import (
+        GGML_Q4_0,
+        dequantize,
+        quantize_q4_0,
+        row_bytes,
+    )
+
+    source = torch.linspace(-1.0, 1.0, 128, dtype=torch.float32).reshape(2, 64)
+    packed = quantize_q4_0(source)
+    assert packed.shape == (2, row_bytes(64, GGML_Q4_0))
+    restored = dequantize(packed.reshape(-1), GGML_Q4_0, torch.float32).reshape_as(source)
+    assert torch.isfinite(restored).all()
+    assert torch.max(torch.abs(restored - source)) < 0.16
+
+
 def test_row_bytes_rejects_unknown_and_partial_blocks():
     from freetoken.models.gguf.dequant import GGML_Q4_0, row_bytes
 

@@ -9,14 +9,14 @@ metadata. ``expert_quant``/``attn_quant``/``dense_quant`` are set to ``"gguf"`` 
 ``convert_qwen35moe_to_gguf`` can detect the native-quant checkpoint and swap the dense
 projections for native GGUF-quant ops.
 
-Quantized projections (full-attn q/k/v/o, GDN qkv|z and out_proj, shared-expert gate/up/
-down, the token embedding and the lm_head) stay in their native packed block layout (Q8_0
-projections, Q6_K head) and are yielded as ``.qweight`` (uint8); tiny F32 tensors (norms,
-router, GDN b/a) dequantize to bf16; GDN conv/A_log/dt_bias stay fp32. Routed experts
-(Q4_K gate/up, Q5_K/Q6_K down) stay packed. Resident mode loads them into model
-buffers; plain GPU offload uses ``load_gguf_expert_sources_native`` and retains each
-down type with a padded Q6_K row stride; CPU/hybrid/converter paths use
-``load_gguf_expert_sources`` and its legacy uniform Q8_0 down banks.
+Quantized projections stay in their source-native packed block layout and are yielded as
+``.qweight`` (uint8); tiny F32 tensors (norms, router, GDN b/a) dequantize to bf16; GDN
+conv/A_log/dt_bias stay fp32. Source tensor types may vary by projection and layer, so
+merged projections retain per-slice packed buffers. Routed experts retain Q4_K/Q5_K/Q6_K/
+Q8_0 rows. Resident mode uses native per-layer buffers; GPU offload uses
+``load_gguf_expert_sources_native`` with padded strides and explicit type dispatch; CPU
+decode converts one source tensor at a time to the executor's Q4_0 contract. Legacy
+converter/offload banks remain available with uniform Q8_0 down rows.
 """
 
 from __future__ import annotations
@@ -33,11 +33,13 @@ from freetoken.models.config import (
 )
 from freetoken.models.gguf.dequant import (
     GGML_F32,
+    GGML_Q4_0,
     GGML_Q4_K,
     GGML_Q5_K,
     GGML_Q6_K,
     GGML_Q8_0,
     dequantize,
+    quantize_q4_0,
     quantize_q8_0,
     row_bytes,
 )
@@ -60,6 +62,7 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     m = shim.metadata
 
     down_quant_types = _gguf_down_quant_types(shim.model_path)
+    gate_up_quant_types = _gguf_gate_up_quant_types(shim.model_path)
 
     def g(key: str):
         val = m.get(f"qwen35moe.{key}")
@@ -75,8 +78,13 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     max_pos = int(g("context_length"))
     interval = int(g("full_attention_interval"))  # every Nth (1-indexed) layer is full
 
-    full_ids = tuple(i for i in range(num_layers) if (i + 1) % interval == 0)
-    linear_ids = tuple(i for i in range(num_layers) if (i + 1) % interval != 0)
+    full_ids = set(i for i in range(num_layers) if (i + 1) % interval == 0)
+    # Qwen3.5 GGUF exports carry one terminal full-attention block beyond the
+    # interval schedule. Source tensor presence is authoritative for this exception.
+    full_ids.update(_gguf_full_attention_layers(shim.model_path))
+    full_ids = tuple(sorted(full_ids))
+    full_id_set = set(full_ids)
+    linear_ids = tuple(i for i in range(num_layers) if i not in full_id_set)
 
     full_rotary = RotaryConfig(
         head_dim=full_head_dim,
@@ -135,6 +143,8 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         lm_head_quant="gguf",
         moe_weight_format="gguf",
         gguf_down_quant_types=down_quant_types,
+        gguf_gate_up_quant_types=gate_up_quant_types,
+        gguf_tensor_types=_gguf_tensor_types(shim.model_path),
     )
 
 
@@ -156,9 +166,9 @@ def _gguf_down_quant_types(model_path: str) -> tuple[int, ...]:
             continue
         layer = int(tensor.name.split(".")[1])
         quant_type = int(tensor.tensor_type)
-        if quant_type not in (GGML_Q5_K, GGML_Q6_K):
+        if quant_type not in (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0):
             raise ValueError(
-                f"{tensor.name}: resident GGUF supports Q5_K/Q6_K down experts, "
+                f"{tensor.name}: resident GGUF supports Q4_K/Q5_K/Q6_K/Q8_0 down experts, "
                 f"got ggml type {quant_type}"
             )
         prior = types.setdefault(layer, quant_type)
@@ -170,6 +180,70 @@ def _gguf_down_quant_types(model_path: str) -> tuple[int, ...]:
     if set(types) != set(range(last + 1)):
         raise ValueError(f"GGUF expert down types missing layers: expected 0..{last}, got {sorted(types)}")
     return tuple(types[i] for i in range(last + 1))
+
+
+def _gguf_gate_up_quant_types(model_path: str) -> tuple[int, ...]:
+    """Read routed gate/up types; GGUF exports may change format at terminal blocks."""
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
+
+    gate: dict[int, int] = {}
+    up: dict[int, int] = {}
+    allowed = (GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0)
+    for shard in gguf_shard_paths(model_path):
+        for tensor in _reader(shard).tensors:
+            if not tensor.name.startswith("blk."):
+                continue
+            if tensor.name.endswith("ffn_gate_exps.weight"):
+                target = gate
+            elif tensor.name.endswith("ffn_up_exps.weight"):
+                target = up
+            else:
+                continue
+            layer = int(tensor.name.split(".")[1])
+            quant_type = int(tensor.tensor_type)
+            if quant_type not in allowed:
+                raise ValueError(
+                    f"{tensor.name}: unsupported GGUF gate/up type {quant_type}; "
+                    "expected Q4_K/Q5_K/Q6_K/Q8_0"
+                )
+            prior = target.setdefault(layer, quant_type)
+            if prior != quant_type:
+                raise ValueError(f"{tensor.name}: expert gate/up type changed within layer")
+    if gate != up:
+        raise ValueError(
+            f"GGUF expert gate/up quant types disagree: gate={sorted(gate.items())}, "
+            f"up={sorted(up.items())}"
+        )
+    if not gate:
+        return ()
+    last = max(gate)
+    if set(gate) != set(range(last + 1)):
+        raise ValueError(f"GGUF expert gate/up types missing layers: expected 0..{last}")
+    return tuple(gate[i] for i in range(last + 1))
+
+
+def _gguf_tensor_types(model_path: str) -> tuple[tuple[str, int], ...]:
+    """Capture native tensor types from GGUF headers without reading payload bytes."""
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
+
+    result: list[tuple[str, int]] = []
+    for shard in gguf_shard_paths(model_path):
+        result.extend((t.name, int(t.tensor_type)) for t in _reader(shard).tensors)
+    return tuple(result)
+
+
+def _gguf_full_attention_layers(model_path: str) -> tuple[int, ...]:
+    """Find GGUF blocks carrying standalone full-attention q/k/v tensors."""
+    from freetoken.models.gguf.reader import _reader, gguf_shard_paths
+
+    layers: set[int] = set()
+    for shard in gguf_shard_paths(model_path):
+        layers.update(
+            int(t.name.split(".")[1])
+            for t in _reader(shard).tensors
+            if t.name.startswith("blk.") and t.name.endswith("attn_q.weight")
+        )
+    return tuple(sorted(layers))
 
 
 # --------------------------------------------------------------------------------------
@@ -187,52 +261,70 @@ def convert_qwen35moe_to_gguf(model, config: ModelConfig) -> None:
     routers, and the GDN conv1d/A_log/dt_bias. Routed experts are native-resident when
     selected, or remain in host banks for offload.
     """
-    from freetoken.layers.gguf import GGUFEmbedding, GGUFLinear
+    from freetoken.layers.gguf import GGUFMergedLinear, GGUFEmbedding, GGUFLinear
     from freetoken.models.gguf.dequant import GGML_Q6_K, GGML_Q8_0
 
     inner = model.model
+    source_types = dict(getattr(config, "gguf_tensor_types", ()))
+
+    def qtype(name: str, fallback: int) -> int:
+        return int(source_types.get(name, fallback))
+
     inner.embed_tokens = GGUFEmbedding(
         num_embeddings=config.vocab_size,
         embedding_dim=config.hidden_size,
-        quant_type=GGML_Q8_0,
-        quant_role="token_embedding",
+        quant_type=qtype("token_embd.weight", GGML_Q8_0),
     )
     model.lm_head = GGUFLinear(
-        config.hidden_size, config.vocab_size, GGML_Q6_K, has_bias=False,
-        operation="lm_head", quant_role="lm_head",
+        config.hidden_size, config.vocab_size,
+        qtype("output.weight", GGML_Q6_K), has_bias=False,
     )
     shared_I = config.shared_expert_intermediate_size
 
     for layer in inner.layers.op_list:
         if layer._is_linear:
             g = layer.linear_attn
-            g.in_proj_qkvz = GGUFLinear(
-                config.hidden_size, g.conv_dim + g.value_dim, GGML_Q8_0,
-                has_bias=False, quant_role="gdn_qkvz"
+            g.in_proj_qkvz = GGUFMergedLinear(
+                config.hidden_size, [g.conv_dim, g.value_dim],
+                [
+                    qtype(f"blk.{layer._layer_id}.attn_qkv.weight", GGML_Q8_0),
+                    qtype(f"blk.{layer._layer_id}.attn_gate.weight", GGML_Q8_0),
+                ], has_bias=False,
             )
             g.out_proj = GGUFLinear(
-                g.value_dim, config.hidden_size, GGML_Q8_0, has_bias=False, quant_role="gdn_out"
+                g.value_dim, config.hidden_size,
+                # K-quant blocks span two 128-wide value heads, so packed column
+                # de-interleaving is impossible without changing block boundaries.
+                # The loader normalizes non-Q8 GDN output rows after de-interleaving.
+                GGML_Q8_0,
+                has_bias=False,
             )
         else:
             attn = layer.self_attn
-            attn.qkv_proj = GGUFLinear(
+            attn.qkv_proj = GGUFMergedLinear(
                 config.hidden_size,
-                attn.num_q * attn.head_dim * 2 + 2 * attn.kv_attn_dim,
-                GGML_Q8_0,
-                has_bias=False, quant_role="attention_qkv",
+                attn._qkv_split,
+                [
+                    qtype(f"blk.{layer._layer_id}.attn_q.weight", GGML_Q8_0),
+                    qtype(f"blk.{layer._layer_id}.attn_k.weight", GGML_Q8_0),
+                    qtype(f"blk.{layer._layer_id}.attn_v.weight", GGML_Q8_0),
+                ], has_bias=False,
             )
             attn.o_proj = GGUFLinear(
-                attn.qo_attn_dim, config.hidden_size, GGML_Q8_0, has_bias=False,
-                quant_role="attention_output"
+                attn.qo_attn_dim, config.hidden_size,
+                qtype(f"blk.{layer._layer_id}.attn_output.weight", GGML_Q8_0), has_bias=False,
             )
         m = layer.mlp
-        m.shared_expert.gate_up_proj = GGUFLinear(
-            config.hidden_size, 2 * shared_I, GGML_Q8_0, has_bias=False,
-            quant_role="shared_gate_up"
+        m.shared_expert.gate_up_proj = GGUFMergedLinear(
+            config.hidden_size, [shared_I, shared_I],
+            [
+                qtype(f"blk.{layer._layer_id}.ffn_gate_shexp.weight", GGML_Q8_0),
+                qtype(f"blk.{layer._layer_id}.ffn_up_shexp.weight", GGML_Q8_0),
+            ], has_bias=False,
         )
         m.shared_expert.down_proj = GGUFLinear(
-            shared_I, config.hidden_size, GGML_Q8_0, has_bias=False,
-            quant_role="shared_down"
+            shared_I, config.hidden_size,
+            qtype(f"blk.{layer._layer_id}.ffn_down_shexp.weight", GGML_Q8_0), has_bias=False,
         )
 
 
@@ -321,6 +413,14 @@ def _deint_q8_cols(
     return m[:, _gdn_head_perm(num_vheads), :].reshape(packed.shape)
 
 
+def _deint_dense_cols(
+    dense: torch.Tensor, num_vheads: int, head_dim: int
+) -> torch.Tensor:
+    """De-interleave value heads along columns after dequantization."""
+    m = dense.reshape(dense.shape[0], num_vheads, head_dim)
+    return m[:, _gdn_head_perm(num_vheads), :].reshape(dense.shape)
+
+
 def _deint_dense_rows(w: torch.Tensor, num_vheads: int) -> torch.Tensor:
     """De-interleave value heads along the leading (head) dim of a dense tensor."""
     m = w.reshape(num_vheads, -1)
@@ -336,12 +436,10 @@ def iter_gguf_weights(
 ) -> Iterator[tuple[str, torch.Tensor]]:
     """Yield packed state tensors for Qwen3.5-MoE.
 
-    Quantized projections stay packed and are yielded as ``.qweight`` (uint8); the F32
-    norms/router/GDN b,a dequantize to bf16; conv1d/A_log/dt_bias stay fp32. Full-attention
-    q/k/v -> ``self_attn.qkv_proj.qweight``, GDN qkv|z -> ``linear_attn.in_proj_qkvz.qweight``
-    (Q8_0, concat along the output dim), GDN b|a -> ``linear_attn.in_proj_ba.weight`` (dense
-    bf16). Routed experts are skipped for offload and yielded as native packed banks for
-    resident mode.
+    Quantized projections stay packed and are yielded as ``.qweight`` (uint8), or as
+    ``.qweight_N`` for mixed-type merged projections; the F32 norms/router/GDN b,a
+    dequantize to bf16; conv1d/A_log/dt_bias stay fp32. Routed experts are skipped for
+    offload and yielded as native packed banks for resident mode.
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
@@ -362,10 +460,10 @@ def iter_gguf_weights(
     key_dim = gdn.num_key_heads * gdn.key_head_dim
     q8_blocks_per_head = vhead_dim // 32  # Q8_0 block = 32
 
-    qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
-    qkvz_buf: dict[int, dict[str, torch.Tensor]] = {}
+    qkv_buf: dict[int, dict[str, tuple[torch.Tensor, int]]] = {}
+    qkvz_buf: dict[int, dict[str, tuple[torch.Tensor, int]]] = {}
     ba_buf: dict[int, dict[str, torch.Tensor]] = {}
-    shexp_buf: dict[int, dict[str, torch.Tensor]] = {}
+    shexp_buf: dict[int, dict[str, tuple[torch.Tensor, int]]] = {}
     expert_buf: dict[int, dict[str, tuple[torch.Tensor, int]]] = {}
 
     for t in iter_gguf_tensors(model_path):
@@ -393,7 +491,12 @@ def iter_gguf_weights(
                 "ffn_up_exps.weight": "up",
                 "ffn_down_exps.weight": "down",
             }[expert_suffix]
-            expected_type = (GGML_Q4_K,) if kind in ("gate", "up") else (GGML_Q5_K, GGML_Q6_K)
+            gate_types = getattr(config, "gguf_gate_up_quant_types", ())
+            expected_type = (gate_types[layer],) if kind in ("gate", "up") and gate_types else (
+                GGML_Q4_K,
+            ) if kind in ("gate", "up") else (
+                GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0
+            )
             if t.ggml_type not in expected_type:
                 raise ValueError(
                     f"{name}: expected {expected_type}, got GGML type {t.ggml_type}"
@@ -407,8 +510,8 @@ def iter_gguf_weights(
                 gate, gate_type = layer_buf["gate"]
                 up, up_type = layer_buf["up"]
                 down, down_type = layer_buf["down"]
-                if gate_type != GGML_Q4_K or up_type != GGML_Q4_K:
-                    raise AssertionError(f"layer {layer}: gate/up expert type is not Q4_K")
+                if gate_type != up_type:
+                    raise AssertionError(f"layer {layer}: gate/up expert types disagree")
                 yield f"model.layers.{layer}.mlp.experts.gate_up_proj", torch.cat(
                     [gate, up], dim=1
                 )
@@ -419,6 +522,11 @@ def iter_gguf_weights(
         layer = int(name.split(".")[1])
         suffix = name.split(".", 2)[2]
         base = f"model.layers.{layer}"
+
+        # Served path is base-model-only; terminal nextn/MTP tensors are optional
+        # speculative heads and have no destination in Qwen3_5MoEForCausalLM.
+        if suffix.startswith("nextn."):
+            continue
 
         if suffix == "ssm_conv1d.weight":
             # conv channels span [q|k|v]; the v channels are value-head interleaved too.
@@ -453,20 +561,28 @@ def iter_gguf_weights(
 
             is_full = layer in full_layers
             if is_full and suffix in ("attn_q.weight", "attn_k.weight", "attn_v.weight"):
-                qkv_buf.setdefault(layer, {})[suffix[5]] = t.packed()
+                qkv_buf.setdefault(layer, {})[suffix[5]] = (t.packed(), t.ggml_type)
             elif suffix == "attn_qkv.weight":
-                qkvz_buf.setdefault(layer, {})["qkv"] = t.packed()
+                qkvz_buf.setdefault(layer, {})["qkv"] = (t.packed(), t.ggml_type)
             elif suffix == "attn_gate.weight":
-                qkvz_buf.setdefault(layer, {})["z"] = t.packed()
+                qkvz_buf.setdefault(layer, {})["z"] = (t.packed(), t.ggml_type)
             elif suffix == "attn_output.weight":
                 yield f"{base}.self_attn.o_proj.qweight", t.packed()
             elif suffix == "ssm_out.weight":
-                yield f"{base}.linear_attn.out_proj.qweight", _deint_q8_cols(
-                    t.packed(), n_vheads, q8_blocks_per_head)
+                if t.ggml_type == GGML_Q8_0:
+                    packed = _deint_q8_cols(t.packed(), n_vheads, q8_blocks_per_head)
+                else:
+                    # K-quant blocks are wider than one GDN value head. Dequantize
+                    # only this projection, de-interleave columns, then repack Q8_0
+                    # so the runtime sees correct HF head order with fixed row blocks.
+                    packed = quantize_q8_0(
+                        _deint_dense_cols(_to_fp32(t), n_vheads, vhead_dim)
+                    )
+                yield f"{base}.linear_attn.out_proj.qweight", packed
             elif suffix == "ffn_gate_shexp.weight":
-                shexp_buf.setdefault(layer, {})["gate"] = t.packed()
+                shexp_buf.setdefault(layer, {})["gate"] = (t.packed(), t.ggml_type)
             elif suffix == "ffn_up_shexp.weight":
-                shexp_buf.setdefault(layer, {})["up"] = t.packed()
+                shexp_buf.setdefault(layer, {})["up"] = (t.packed(), t.ggml_type)
             elif suffix == "ffn_down_shexp.weight":
                 yield f"{base}.mlp.shared_expert.down_proj.qweight", t.packed()
             else:
@@ -474,18 +590,28 @@ def iter_gguf_weights(
 
         slots = qkv_buf.get(layer)
         if slots is not None and {"q", "k", "v"} <= set(slots):
-            yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
-                [slots["q"], slots["k"], slots["v"]], dim=0)
+            parts = [slots[key] for key in ("q", "k", "v")]
+            if len({item[1] for item in parts}) == 1:
+                yield f"{base}.self_attn.qkv_proj.qweight", torch.cat(
+                    [item[0] for item in parts], dim=0)
+            else:
+                for index, (packed, _qtype) in enumerate(parts):
+                    yield f"{base}.self_attn.qkv_proj.qweight_{index}", packed
             del qkv_buf[layer]
         qz = qkvz_buf.get(layer)
         if qz is not None and "qkv" in qz and "z" in qz:
-            qkv = qz["qkv"]  # [2*key_dim + value_dim, cols]
+            qkv, qkv_type = qz["qkv"]  # [2*key_dim + value_dim, cols]
+            z, z_type = qz["z"]
             qkv = qkv.clone()
             # de-interleave the value rows (last value_dim rows of the qkv projection)
             qkv[key_dim * 2:] = _deint_q8_rows(
                 qkv[key_dim * 2:], n_vheads, vhead_dim)
-            z = _deint_q8_rows(qz["z"], n_vheads, vhead_dim)
-            yield f"{base}.linear_attn.in_proj_qkvz.qweight", torch.cat([qkv, z], dim=0)
+            z = _deint_q8_rows(z, n_vheads, vhead_dim)
+            if qkv_type == z_type:
+                yield f"{base}.linear_attn.in_proj_qkvz.qweight", torch.cat([qkv, z], dim=0)
+            else:
+                yield f"{base}.linear_attn.in_proj_qkvz.qweight_0", qkv
+                yield f"{base}.linear_attn.in_proj_qkvz.qweight_1", z
             del qkvz_buf[layer]
         ba = ba_buf.get(layer)
         if ba is not None and "b" in ba and "a" in ba:
@@ -495,8 +621,13 @@ def iter_gguf_weights(
             del ba_buf[layer]
         gu = shexp_buf.get(layer)
         if gu is not None and "gate" in gu and "up" in gu:
-            yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
-                [gu["gate"], gu["up"]], dim=0)
+            parts = [gu[key] for key in ("gate", "up")]
+            if len({item[1] for item in parts}) == 1:
+                yield f"{base}.mlp.shared_expert.gate_up_proj.qweight", torch.cat(
+                    [item[0] for item in parts], dim=0)
+            else:
+                for index, (packed, _qtype) in enumerate(parts):
+                    yield f"{base}.mlp.shared_expert.gate_up_proj.qweight_{index}", packed
             del shexp_buf[layer]
 
     assert not qkv_buf, f"incomplete qkv groups: {sorted(qkv_buf)}"
@@ -510,23 +641,20 @@ def iter_gguf_weights(
 # --------------------------------------------------------------------------------------
 # Routed-expert host banks for the offload cache.
 #
-# The GGUF stores gate/up as Q4_K on every layer, but ``down`` as Q5_K on 37 layers and
-# Q6_K on 3 -- heterogeneous row widths the offload cache cannot hold in one uniform bank
-# (``set_bank_sources`` requires every layer to share a shape, and ``ggml_moe_a8_vec``
-# derives the row stride from the quant type). We keep ``gate_up`` native Q4_K and
-# re-quantize the ``down`` experts to Q8_0 (8-bit, >= Q5_K/Q6_K precision, so no quality
-# loss; a uniform per-bank format that fits the cache machinery).
+# The GGUF stores mostly Q4_K gate/up rows, but terminal full-attention blocks may use Q8_0;
+# down rows also vary by layer. The offload cache requires uniform bank shapes, so each bank
+# uses maximum native row width and dispatch carries actual per-layer type. Legacy CPU/hybrid
+# down banks still re-quantize to uniform Q8_0; native GPU banks retain source down types.
 # --------------------------------------------------------------------------------------
 
 
 def load_gguf_expert_sources(
     model_path: str, config: ModelConfig, *, layer_sink=None
 ) -> dict[str, list[torch.Tensor]]:
-    """Per-layer host banks of the routed experts: ``gate_up`` native Q4_K
-    ``[E, 2I, row_bytes(H, Q4_K)]`` and ``down`` Q8_0 ``[E, H, row_bytes(I, Q8_0)]``.
+    """Per-layer host banks of routed experts with padded native gate/up rows and Q8_0 down.
 
-    ``ffn_{gate,up}_exps`` are each ``[E, I, row_bytes(H, Q4_K)]`` packed and are fused
-    along the intermediate dim into ``gate_up``; ``ffn_down_exps`` (Q5_K/Q6_K) is
+    ``ffn_{gate,up}_exps`` are each ``[E, I, row_bytes(H, gate_type)]`` packed and are fused
+    along the intermediate dim into ``gate_up``; ``ffn_down_exps`` is
     dequantized and re-quantized to Q8_0. Whole layers complete in two writes
     (gate_up + down). ``layer_sink=None`` (serving): pin each layer's banks as they
     complete via an internal :class:`PinPipeline`.
@@ -537,10 +665,11 @@ def load_gguf_expert_sources(
     _require_tp1("expert banks")
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
-    h_rb = row_bytes(H, GGML_Q4_K)
+    gate_types = getattr(config, "gguf_gate_up_quant_types", ()) or (GGML_Q4_K,) * L
+    gate_rb = max(row_bytes(H, q) for q in set(gate_types))
     i_rb = row_bytes(I, GGML_Q8_0)
     specs = {
-        "gate_up": ((E, 2 * I, h_rb), torch.uint8),
+        "gate_up": ((E, 2 * I, gate_rb), torch.uint8),
         "down": ((E, H, i_rb), torch.uint8),
     }
     hb = alloc_layer_banks(specs, L)
@@ -553,9 +682,11 @@ def load_gguf_expert_sources(
                 continue
             layer = int(t.name.split(".")[1])
             if t.name.endswith("ffn_gate_exps.weight"):
-                banks["gate_up"][layer][:, :I].copy_(t.packed().reshape(E, I, h_rb))
+                packed = t.packed().reshape(E, I, t.row_bytes)
+                banks["gate_up"][layer][:, :I, :t.row_bytes].copy_(packed)
             elif t.name.endswith("ffn_up_exps.weight"):
-                banks["gate_up"][layer][:, I:] = t.packed().reshape(E, I, h_rb)
+                packed = t.packed().reshape(E, I, t.row_bytes)
+                banks["gate_up"][layer][:, I:, :t.row_bytes].copy_(packed)
             elif t.name.endswith("ffn_down_exps.weight"):
                 flat = dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32)
                 banks["down"][layer].copy_(quantize_q8_0(flat.reshape(E, H, I)))
@@ -591,12 +722,14 @@ def load_gguf_expert_sources_native(
     _require_tp1("native expert banks")
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
-    h_rb = row_bytes(H, GGML_Q4_K)
+    gate_types = getattr(config, "gguf_gate_up_quant_types", ()) or (GGML_Q4_K,) * L
+    gate_rb = max(row_bytes(H, qtype) for qtype in set(gate_types))
     q5_rb = row_bytes(I, GGML_Q5_K)
     q6_rb = row_bytes(I, GGML_Q6_K)
+    q8_rb = row_bytes(I, GGML_Q8_0)
     specs = {
-        "gate_up": ((E, 2 * I, h_rb), torch.uint8),
-        "down": ((E, H, q6_rb), torch.uint8),
+        "gate_up": ((E, 2 * I, gate_rb), torch.uint8),
+        "down": ((E, H, max(q6_rb, q8_rb)), torch.uint8),
     }
     hb = alloc_layer_banks(specs, L)
     banks = {name: [b.tensor for b in hb[name]] for name in specs}
@@ -608,25 +741,83 @@ def load_gguf_expert_sources_native(
                 continue
             layer = int(t.name.split(".")[1])
             if t.name.endswith("ffn_gate_exps.weight"):
-                banks["gate_up"][layer][:, :I].copy_(
-                    t.packed().reshape(E, I, h_rb)
-                )
+                packed = t.packed().reshape(E, I, t.row_bytes)
+                banks["gate_up"][layer][:, :I, :t.row_bytes].copy_(packed)
             elif t.name.endswith("ffn_up_exps.weight"):
-                banks["gate_up"][layer][:, I:].copy_(
-                    t.packed().reshape(E, I, h_rb)
-                )
+                packed = t.packed().reshape(E, I, t.row_bytes)
+                banks["gate_up"][layer][:, I:, :t.row_bytes].copy_(packed)
             elif t.name.endswith("ffn_down_exps.weight"):
-                if t.ggml_type == GGML_Q5_K:
+                if t.ggml_type == GGML_Q4_K:
+                    packed = t.packed().reshape(E, H, row_bytes(I, GGML_Q4_K))
+                    banks["down"][layer][:, :, :packed.shape[-1]].copy_(packed)
+                elif t.ggml_type == GGML_Q5_K:
                     packed = t.packed().reshape(E, H, q5_rb)
                     banks["down"][layer][:, :, :q5_rb].copy_(packed)
                 elif t.ggml_type == GGML_Q6_K:
                     banks["down"][layer].copy_(
                         t.packed().reshape(E, H, q6_rb)
                     )
+                elif t.ggml_type == GGML_Q8_0:
+                    packed = t.packed().reshape(E, H, q8_rb)
+                    banks["down"][layer][:, :, :q8_rb].copy_(packed)
                 else:
                     raise ValueError(
                         f"native GGUF down layer {layer} has unsupported type {t.ggml_type}"
                     )
+            else:
+                continue
+            if tracker is not None:
+                tracker.note(layer)
+
+    if layer_sink is not None:
+        _load(layer_sink)
+    elif torch.cuda.is_available():
+        with PinPipeline() as pins:
+            _load(pins)
+    else:
+        _load(None)
+    return banks
+
+
+def load_gguf_expert_sources_cpu(
+    model_path: str, config: ModelConfig, *, layer_sink=None
+) -> dict[str, list[torch.Tensor]]:
+    """Convert mixed-native Qwen GGUF experts to the CPU executor's Q4_0 schema.
+
+    Qwen3.5 GGUF uses Q4_K/Q5_K/Q6_K/Q8_0 rows, while the portable CPU MoE
+    executor intentionally accepts one packed layout: Q4_0 gate/up and down.
+    Convert one source tensor at a time so CPU decode works without the
+    CUDA-only ``flashlib`` slot-cache dependency or a second dense expert bank.
+    """
+    from freetoken.moe.host_banks import LayerCompletionTracker, PinPipeline, alloc_layer_banks
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+
+    _require_tp1("CPU expert banks")
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+    specs = {
+        "gate_up": ((E, 2 * I, row_bytes(H, GGML_Q4_0)), torch.uint8),
+        "down": ((E, H, row_bytes(I, GGML_Q4_0)), torch.uint8),
+    }
+    hb = alloc_layer_banks(specs, L)
+    banks = {name: [b.tensor for b in hb[name]] for name in specs}
+
+    def _convert(t, shape):
+        dense = dequantize(t.packed().reshape(-1), t.ggml_type, torch.float32)
+        return quantize_q4_0(dense.reshape(*shape))
+
+    def _load(sink) -> None:
+        tracker = LayerCompletionTracker(2, hb, sink) if sink is not None else None
+        for t in iter_gguf_tensors(model_path):
+            if not t.name.startswith("blk."):
+                continue
+            layer = int(t.name.split(".")[1])
+            if t.name.endswith("ffn_gate_exps.weight"):
+                banks["gate_up"][layer][:, :I].copy_(_convert(t, (E, I, H)))
+            elif t.name.endswith("ffn_up_exps.weight"):
+                banks["gate_up"][layer][:, I:].copy_(_convert(t, (E, I, H)))
+            elif t.name.endswith("ffn_down_exps.weight"):
+                banks["down"][layer].copy_(_convert(t, (E, H, I)))
             else:
                 continue
             if tracker is not None:
@@ -649,4 +840,5 @@ __all__ = [
     "is_gguf_model",
     "load_gguf_expert_sources",
     "load_gguf_expert_sources_native",
+    "load_gguf_expert_sources_cpu",
 ]

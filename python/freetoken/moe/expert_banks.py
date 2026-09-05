@@ -261,9 +261,19 @@ def _gguf_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     if dummy:
         raise NotImplementedError("gguf expert banks have no dummy path; load the real GGUF")
     from freetoken.models.weight import (
+        load_gguf_moe_expert_sources_cpu,
         load_gguf_moe_expert_sources,
         load_gguf_moe_expert_sources_native,
     )
+
+    # The CPU executor has one deliberate packed contract (Q4_0). Qwen3.5 GGUF
+    # keeps source-native mixed K-quants for GPU offload, so convert only when
+    # CPU/hybrid decode is selected; this avoids flashlib and preserves GPU rows.
+    if decode_target in ("cpu", "hybrid") and layer_sink is None:
+        sources = load_gguf_moe_expert_sources_cpu(model_path, model_config)
+        return ExpertBanks(
+            "q4_0", {name: sources[name] for name in _BANK_SCHEMAS["q4_0"]}, streamed=False
+        )
 
     native = decode_target == "gpu" and layer_sink is None
     loader = load_gguf_moe_expert_sources_native if native else load_gguf_moe_expert_sources
